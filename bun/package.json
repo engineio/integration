@@ -1,0 +1,24 @@
+{
+  "name": "@easygo/operator-example",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "module": "src/main.ts",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "dev": "bun --watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "tigerbeetle-node": "0.17.7"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^11.0.0",
+    "@types/bun": "latest",
+    "json-schema-to-ts": "^3.1.1",
+    "testcontainers": "^11.0.0",
+    "typescript": "^5.7.0"
+  }
+}

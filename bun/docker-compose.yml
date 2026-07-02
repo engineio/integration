@@ -1,0 +1,149 @@
+# Minimal self-contained stack: the wallet (built from ./Dockerfile), Postgres for the bet
+# ledger, and a small 3-replica TigerBeetle cluster for the balance ledger.
+#
+#   docker compose up --build
+#
+# First run generates an RSA keypair into ./keys/ (the RGS would normally hold the private
+# key — here you use it to sign test requests). Then:
+#
+#   # create a dev session (DEV_ENDPOINTS=true exposes this unauthenticated route)
+#   curl -s localhost:3000/v1/dev/session -d '{"currency":"USD","startingBalance":100000}'
+#
+#   # signed balance call
+#   BODY='{"token":"<token from above>"}'
+#   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -sign keys/private.key | base64 -w0)
+#   curl -s localhost:3000/v1/balance -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"
+#
+# Notes on the shape of this file:
+# - The TigerBeetle client parses replica addresses as numeric IP:port only (no hostnames),
+#   so the replicas sit on fixed IPs in a dedicated subnet instead of using service names.
+# - Both the replicas and the wallet run with seccomp=unconfined: TigerBeetle (server and
+#   client) uses io_uring, which Docker's default seccomp profile blocks.
+
+name: wallet-example
+
+x-tigerbeetle: &tigerbeetle
+  image: ghcr.io/tigerbeetle/tigerbeetle:0.17.7 # must match the tigerbeetle-node version
+  security_opt: ["seccomp=unconfined"]
+  entrypoint: /bin/sh
+
+services:
+  # One-shot: generate the RGS keypair into ./keys/ if it isn't there yet.
+  keygen:
+    image: alpine/openssl
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        [ -f /keys/private.key ] || {
+          openssl genrsa -out /keys/private.key 4096
+          openssl pkey -in /keys/private.key -pubout -out /keys/public.key
+        }
+        chmod 644 /keys/public.key
+    volumes:
+      - ./keys:/keys
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: operator
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d operator"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # A 3-replica cluster. `format` creates the data file once (guarded so restarts don't
+  # re-format); `start --development` relaxes the direct-I/O / memory-locking requirements
+  # so it runs cheaply in a container. Every replica gets the full address list and picks
+  # its own from the replica index baked into its data file.
+  tigerbeetle-0:
+    <<: *tigerbeetle
+    command:
+      - -c
+      - |
+        [ -f /data/0_0.tigerbeetle ] || /tigerbeetle format --cluster=0 --replica=0 --replica-count=3 /data/0_0.tigerbeetle
+        exec /tigerbeetle start --development --addresses=172.28.100.10:3000,172.28.100.11:3000,172.28.100.12:3000 /data/0_0.tigerbeetle
+    volumes:
+      - tb0:/data
+    networks:
+      default:
+        ipv4_address: 172.28.100.10
+
+  tigerbeetle-1:
+    <<: *tigerbeetle
+    command:
+      - -c
+      - |
+        [ -f /data/0_1.tigerbeetle ] || /tigerbeetle format --cluster=0 --replica=1 --replica-count=3 /data/0_1.tigerbeetle
+        exec /tigerbeetle start --development --addresses=172.28.100.10:3000,172.28.100.11:3000,172.28.100.12:3000 /data/0_1.tigerbeetle
+    volumes:
+      - tb1:/data
+    networks:
+      default:
+        ipv4_address: 172.28.100.11
+
+  tigerbeetle-2:
+    <<: *tigerbeetle
+    command:
+      - -c
+      - |
+        [ -f /data/0_2.tigerbeetle ] || /tigerbeetle format --cluster=0 --replica=2 --replica-count=3 /data/0_2.tigerbeetle
+        exec /tigerbeetle start --development --addresses=172.28.100.10:3000,172.28.100.11:3000,172.28.100.12:3000 /data/0_2.tigerbeetle
+    volumes:
+      - tb2:/data
+    networks:
+      default:
+        ipv4_address: 172.28.100.12
+
+  wallet:
+    build: .
+    security_opt: ["seccomp=unconfined"] # the TigerBeetle client needs io_uring too
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/operator
+      BALANCE_BACKEND: tigerbeetle
+      TB_CLUSTER_ID: "0"
+      TB_ADDRESS: 172.28.100.10:3000,172.28.100.11:3000,172.28.100.12:3000
+      DEV_ENDPOINTS: "true"
+    # RGS_PUBLIC_KEY is the base64 of the PEM, so it's derived from the generated key at
+    # start rather than hardcoded. $$ escapes $ from compose interpolation.
+    command:
+      - /bin/sh
+      - -c
+      - export RGS_PUBLIC_KEY=$$(base64 -w0 < /keys/public.key) && exec bun run main.js
+    volumes:
+      - ./keys:/keys:ro
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      tigerbeetle-0:
+        condition: service_started
+      tigerbeetle-1:
+        condition: service_started
+      tigerbeetle-2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://localhost:3000/health'); process.exit(r.ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.100.0/24
+
+volumes:
+  pgdata:
+  tb0:
+  tb1:
+  tb2:
