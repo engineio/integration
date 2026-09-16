@@ -61,8 +61,9 @@ CREATE TABLE balance.account_7 PARTITION OF balance.account FOR VALUES WITH (MOD
 -- and spreads the UUIDv7 right-edge insert hot spot. Lookups prune to one leaf (op_ts →
 -- week, op_key → bucket). Managed by balance.maintain_ledger_partitions.
 --
--- `op_key` is the idempotency key: the RGS transaction id behind the movement
--- (debit.id / credit.id / rollback.id). `op_ts` is its UUIDv7 timestamp — set by
+-- `op_key` is the idempotency key: the wallet's own bet-ledger transaction id behind the
+-- movement (a wallet-minted UUIDv7 — not the RGS id, whose format the wallet doesn't
+-- control). `op_ts` is its UUIDv7 timestamp — set by
 -- balance._move as uuid_extract_timestamp(op_key), so it is a deterministic function of
 -- op_key. That determinism is load-bearing: a replay derives the SAME op_ts, so it routes
 -- to the SAME partition and the PRIMARY KEY (op_key, op_ts) catches it — at-most-once

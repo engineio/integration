@@ -30,7 +30,7 @@ export interface Session {
 }
 
 /** A bet's lifecycle (see repo.bet_status in db/sql/001_init.sql). A bet is a container for 1..N
- *  debits plus an optional single credit. */
+ *  debits plus 0..N credits. */
 export type BetStatus = "pending" | "open" | "closed";
 
 /** A debit transaction's lifecycle (see repo.transaction_status). Credits/rollbacks are always

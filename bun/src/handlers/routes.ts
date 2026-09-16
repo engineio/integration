@@ -1,5 +1,5 @@
 import Ajv from "ajv";
-import { createVerify, type KeyObject } from "node:crypto";
+import { verify, type KeyObject } from "node:crypto";
 import type { Balance } from "../balance";
 import type { Repository } from "../db/repo";
 import { ErrBadAuth, ErrBadRequest, ErrGeneralError, toErrorResponse } from "./errors";
@@ -61,12 +61,13 @@ function createRouter<S extends State>(state: S) {
         const signature = req.headers.get("x-signature");
         if (!signature) throw new ErrBadAuth("Missing signature");
 
-        // Buffer (an ArrayBufferView) so createVerify().update() accepts it and we can
-        // decode the same bytes for JSON.parse — the signature is over these raw bytes.
+        // Ed25519 over the raw body bytes — one-shot verify (no streaming form, hence the
+        // null algorithm). Malformed signature bytes are a bad signature, not a 500.
         const rawBody = Buffer.from(await req.arrayBuffer());
-        const verified = createVerify("RSA-SHA256")
-          .update(rawBody)
-          .verify(state.rgsPublicKey, signature, "base64");
+        let verified = false;
+        try {
+          verified = verify(null, rawBody, state.rgsPublicKey, Buffer.from(signature, "base64"));
+        } catch { /* fall through to ErrBadAuth */ }
         if (!verified) {
           throw new ErrBadAuth("Invalid signature");
         }

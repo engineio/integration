@@ -66,6 +66,33 @@ describe("rollback", () => {
     expect(after).toBe(before); // balance untouched
   });
 
+  walletTest("a late rollback lands long after session launch", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const debitId = uuid();
+    await call("/v1/debit", debit(s.token, 23, debitId, 10_000_000));
+    // The wallet never time-expires sessions: the RGS can cancel a round long after launch and
+    // the refund must still land, authorized against the bet's recorded session (contract §2,
+    // "Session lifetime").
+    await sql`UPDATE repo.session SET created_at = now() - interval '25 hours' WHERE id = ${s.token}::uuid`;
+    const { status, body } = await call("/v1/rollback", signed({ token: s.token, round: 23, rollbacks: [{ id: uuid(), ref: debitId }] }));
+    expect(status).toBe(200);
+    expect(body.balance.amount).toBe(100_000_000);
+  });
+
+  walletTest("ERR_IS when the token doesn't match the session that opened the round", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const other = await session(100_000_000);
+    const debitId = uuid();
+    await call("/v1/debit", debit(s.token, 24, debitId, 10_000_000));
+    // A live token from a DIFFERENT session must not reverse this round's debits — the bet's
+    // recorded session is the authority (session-to-bet alignment), checked before anything moves.
+    const rb = await call("/v1/rollback", signed({ token: other.token, round: 24, rollbacks: [{ id: uuid(), ref: debitId }] }));
+    expect(rb.status).toBe(400);
+    expect(rb.body.code).toBe("ERR_IS");
+    // Nothing was refunded: the stake is still out.
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(90_000_000);
+  });
+
   walletTest("reverses ONE of several debits; the others stand and the round stays open", async ({ call, session }) => {
     const s = await session(100_000_000);
     const round = 30;

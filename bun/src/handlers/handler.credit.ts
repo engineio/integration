@@ -56,6 +56,9 @@ type CreditRequest = FromSchema<typeof schema.request>;
  * its `ref`, a FK to the settled debit), and only then does the win move enginePayout -> available
  * on the balance service, keyed by the credit's id. Replaying a credit returns the stored result;
  * each win is paid at most once across retries. A new credit on an already-closed round is refused.
+ *
+ * Session validation is against the STORED BET: the token must match the session recorded on
+ * the round's bet (ERR_IS otherwise); the session table is never consulted.
  */
 export const creditHandler: Handler<State, CreditRequest> = async ({ body, state }) => {
   const { repo, balance } = state;

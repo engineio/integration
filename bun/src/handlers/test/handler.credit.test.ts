@@ -45,4 +45,34 @@ describe("credit", () => {
     expect(status).toBe(404);
     expect(body.code).toBe("ERR_BNF");
   });
+
+  walletTest("a late credit lands long after session launch", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const debitId = uuid();
+    await call("/v1/debit", signed({ token: s.token, round: 13, active: true, mode: "base", ip: "1.1.1.1", debit: { id: debitId, amount: 10_000_000, currency: "USD" } }));
+    // The wallet never time-expires sessions: the win must still be paid, validated against the
+    // bet's recorded session (contract §2, "Session lifetime").
+    await sql`UPDATE repo.session SET created_at = now() - interval '25 hours' WHERE id = ${s.token}::uuid`;
+    const { status, body } = await call(
+      "/v1/credit",
+      signed({ token: s.token, round: 13, active: false, ip: "1.1.1.1", credit: { id: uuid(), amount: 30_000_000, ref: debitId, currency: "USD" } }),
+    );
+    expect(status).toBe(200);
+    expect(body.balance.amount).toBe(120_000_000);
+  });
+
+  walletTest("ERR_IS when the token doesn't match the session that opened the round", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const other = await session(100_000_000);
+    const debitId = uuid();
+    await call("/v1/debit", signed({ token: s.token, round: 14, active: true, mode: "base", ip: "1.1.1.1", debit: { id: debitId, amount: 10_000_000, currency: "USD" } }));
+    // A perfectly live token from a DIFFERENT session must not settle this round — the bet's
+    // recorded session is the authority (session-to-bet alignment).
+    const { status, body } = await call(
+      "/v1/credit",
+      signed({ token: other.token, round: 14, active: false, ip: "1.1.1.1", credit: { id: uuid(), amount: 30_000_000, ref: debitId, currency: "USD" } }),
+    );
+    expect(status).toBe(400);
+    expect(body.code).toBe("ERR_IS");
+  });
 });

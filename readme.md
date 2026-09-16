@@ -122,7 +122,8 @@ code from a fixed enum (e.g. `USD`, `EUR`, `JPY`).
 ### Identifiers in every request
 
 - **`token`** - the player's session token. You issued this at game launch; it resolves to
-  a player and a currency. Treat an unknown/garbled token as `ERR_IS` (invalid session).
+  a player and a currency. Treat an unknown/garbled token as `ERR_IS` (invalid session);
+  session lifetime is the RGS's concern, not yours (see "Session lifetime" below).
 - **`round`** - the RGS's round id. The round **groups** a bet's transactions; all calls for
   one round (its debits, then a credit or rollbacks) carry the same `round`. A round may hold
   more than one debit, so the round is *not* the identity of a single stake - `debit.id` is.
@@ -142,6 +143,35 @@ generated once per logical operation and re-sent *verbatim* on every retry. This
 foundation of idempotency (§4): treat the ids as **opaque strings**, equal if they name the
 same operation, and don't parse or derive meaning from their contents. That single guarantee is
 all you need.
+
+### Session lifetime
+
+Your wallet never enforces a time-based session expiry. **Session lifetime is the RGS's
+responsibility**: the RGS decides how long a session may keep betting, and it only sends
+wallet calls for sessions it believes still have business - live play, or rounds still
+active. Currently the RGS opens no new bets more than **24 hours** after launch, but that is
+RGS policy and **subject to change** - do not hard-code it into your wallet.
+
+Operator-side, that leaves two rules:
+
+- **Never refuse a wallet call because the session looks old.** While a round is active the
+  RGS may still send debits, credits, or rollbacks for it - however long ago the session was
+  launched. Refusing a late call with `ERR_IS` withholds a player's win or strands a stake
+  the RGS already cancelled.
+- **Validate credits and rollbacks by session-to-bet alignment.** Look up the round's bet in
+  your database and verify the request's token resolves to the same session that opened the
+  bet. The bet record is the anchor: a credit or rollback whose session doesn't match the
+  bet's recorded session is refused with `ERR_IS`. Token age plays no part in the check;
+  session-to-bet alignment always does.
+
+**Cleaning up stale sessions.** A session may be removed (archived or deleted) only once it
+has **no active bets** left - every round it opened is closed (settled, rolled back, or
+closed by an `active:false`). While any round is open, the RGS can still send calls for it,
+and those resolve through the session that opened the bet - remove it early and a late
+credit or rollback comes back as a spurious `ERR_IS`, withholding a win or stranding a
+cancelled stake. Age alone is never the trigger. In practice, since the RGS currently opens
+no new bets after 24 hours, "past the RGS's betting window with no open rounds" is a sound
+sweep condition - but the invariant is the absence of active bets, not the clock.
 
 ### The wire shapes: every field, per endpoint
 
@@ -165,7 +195,7 @@ the same `balance` object:
 { "token": "01927b8e-0000-7000-8000-000000000001" }
 ```
 
-Response is the `balance` object alone. Errors: `ERR_IS` for an unknown/expired token,
+Response is the `balance` object alone. Errors: `ERR_IS` for an unknown token,
 `ERR_ATE` on a bad signature. No mutation, so no `ERR_IPB` / `ERR_BNF` here.
 
 #### `POST /v1/debit`
@@ -214,7 +244,7 @@ unknown token.
 
 | Field             | Type              | Required | Description |
 | ----------------- | ----------------- | -------- | ----------- |
-| `token`           | string            | yes      | Session token. Must be the session that opened the bet. |
+| `token`           | string            | yes      | Session token. Must be the session that opened the bet (verify against the stored bet record). |
 | `round`           | uint64            | yes      | The round being credited. Must have at least one debit — otherwise `ERR_BNF` (credits never open or fence a round). |
 | `active`          | bool              | yes      | `false` closes the round (the common settling case); `true` keeps it open for further credits/debits (staged payouts). |
 | `ip`              | string            | yes      | Player's IP at credit time. Always sent; may be empty. |
@@ -241,13 +271,14 @@ unknown token.
 
 Errors: `ERR_BNF` when the round was never debited. `ERR_BAD` on a currency mismatch. `ERR_BC`
 when a **new** credit lands on a closed round (a replay of an existing `credit.id` returns its
-stored result instead). `ERR_IS` on an unknown token.
+stored result instead). `ERR_IS` on an unknown token, or on a token that doesn't match the
+session recorded on the round's bet (§2, "Session lifetime").
 
 #### `POST /v1/rollback`
 
 | Field             | Type          | Required | Description |
 | ----------------- | ------------- | -------- | ----------- |
-| `token`           | string        | yes      | Session token. |
+| `token`           | string        | yes      | Session token. Must be the session that opened the bet (verify against the stored bet record). |
 | `round`           | uint64        | yes      | The round whose debits are being reversed. |
 | `active`          | bool          | no       | `false` (or omit) closes the round after the reversals; `true` keeps it open for its remaining debits. |
 | `rollbacks`       | array         | yes      | One entry per debit to reverse. Refunds are returned in `rollback_ids` in this same order. |
@@ -271,6 +302,8 @@ stored result instead). `ERR_IS` on an unknown token.
 Errors: `ERR_BC` when the round is already closed or settled (a credited round can't be
 reversed). A `ref` to a debit that never arrived is **not** an error — it's fenced (tombstone,
 `200`, refunds nothing). A referenced debit still mid-flight (`pending`) → retryable `5xx`.
+`ERR_IS` when the token doesn't match the session recorded on the round's bet (§2, "Session
+lifetime").
 
 ### Error response contract
 
@@ -281,10 +314,10 @@ Standard codes:
 | Code      | HTTP  | Meaning                                     | Terminal or retryable? |
 | --------- | ----- | ------------------------------------------- | ---------------------- |
 | `ERR_ATE` | `401` | Failed request authentication — the `x-signature` header is missing or doesn't verify against the RGS public key. | **Terminal** |
-| `ERR_IS`  | `400` | Invalid / unknown session token             | **Terminal** |
+| `ERR_IS`  | `400` | Invalid / unknown session token — or, on a credit/rollback, a token that doesn't match the session recorded on the round's bet (§2). | **Terminal** |
 | `ERR_IPB` | `400` | Insufficient player balance — the **debit alone** can't be covered (a win must not fund its own stake, §6.4). | **Terminal** |
 | `ERR_BAD` | `400` | Malformed request — zero/negative amount, currency mismatch, schema violation, or a debit fenced by a prior rollback (§7.2d). NOT closed-round (that's `ERR_BC`). | **Terminal** |
-| `ERR_BNF` | `404` | Bet (round) not found — a credit/rollback for a round with no debit on this session. | **Terminal** |
+| `ERR_BNF` | `404` | Bet (round) not found — a credit/rollback for a round that was never debited. (A token that doesn't match a *known* round's session is `ERR_IS`, not `ERR_BNF`.) | **Terminal** |
 | `ERR_BC`  | `400` | Bet already complete — a new debit/credit/rollback after the round closed. A replay of an existing transaction id returns its stored result instead of this error. | **Terminal** |
 | `ERR_GE`  | `500` | General / unexpected error, or any outcome you can't yet decide. The RGS retries until it resolves. | **Retryable** |
 | `ERR_UE`  | `500` | Unhandled error during a **rollback** specifically. Same retry semantics as `ERR_GE`. | **Retryable** |
@@ -298,8 +331,8 @@ any failure with `401` `ERR_ATE`:
 
 | Header        | Required | Description |
 | ------------- | -------- | ----------- |
-| `x-signature` | yes      | Base64 **RSA PKCS#1 v1.5 + SHA-256** signature over the **raw request body bytes**, signed with the RGS's private key. Standard base64 (not URL-safe, not PSS). Verify against the RGS public key from the integration site (Settings → Public key). |
-| `Content-Type`| yes      | Always `application/json; charset=utf-8`. |
+| `x-signature` | yes      | Base64 **Ed25519** signature over the **raw request body bytes** (RFC 8032, no pre-hash), signed with the RGS's private key. Standard base64 **with padding** (not URL-safe) — a 64-byte signature, 88 base64 characters. Verify against the RGS Ed25519 public key (PEM, `BEGIN PUBLIC KEY`) from the integration site (Settings → Public key). |
+| `Content-Type`| yes      | `application/json; charset=utf-8` in production; the conformance suite sends a bare `application/json` — accept both. |
 
 (There is no operator-identifying header on inbound wallet calls — there are many wallets but
 only one RGS, so the signature alone proves who's calling. The identification requirement runs
@@ -316,10 +349,13 @@ the other way: *your* calls to Engine carry `X-Operator`, below.)
 
 The wallet endpoints above are Engine calling **you**. There are also three
 operator-initiated endpoints **you call**, at base URL `https://operator.stake-engine.com`. The
-auth direction reverses: sign each request body with **your** private key (same scheme — base64
-RSA PKCS#1 v1.5 + SHA-256 over the raw body) and send `X-Operator` + `X-Signature` on every
-call; Engine verifies with the public key you uploaded on the integration site. For GETs,
-sign the empty body (zero bytes).
+auth direction reverses: sign each request body with **your** Ed25519 private key (same scheme —
+base64 Ed25519 over the raw body) and send `X-Operator` + `X-Signature` on every call; Engine
+verifies with the public key you uploaded on the integration site. For GETs, sign the empty
+body (zero bytes). Generate the keypair with `openssl genpkey -algorithm ed25519` and upload
+the public key as PEM (`openssl pkey -pubout`, a `BEGIN PUBLIC KEY` block). Integrations
+created before the key migration may still sign with legacy RSA keys — the ingress accepts
+both during rotation — but new keys must be Ed25519.
 
 #### `POST /game/url` — start a real-money session
 
@@ -415,8 +451,11 @@ in application logic - constraints cannot be forgotten under a race.
 ### What to key on
 
 - **The bet (round).** `round` is the bet's primary key. Make it the actual `PRIMARY KEY` of
-  your bet/round table. A second debit for the same round then fails with a unique violation,
-  which you catch and turn into the idempotent-replay path - not a second bet.
+  your bet/round table so the round is created exactly once even under racing first debits
+  (insert with `ON CONFLICT DO NOTHING`, or catch the unique violation and use the existing
+  row). The round is a **container**, not an idempotency key: a debit with a *new* `debit.id`
+  on an existing open round ADDS a stake (§2, §6.6) - only the transaction id decides replay
+  vs. new.
 - **Each transaction.** Each money movement's RGS id (`debit.id`, `credit.id`, `rollback.id`)
   gets a `UNIQUE` constraint in your transaction table. A replayed movement hits the unique
   violation; you return the originally stored result.
@@ -959,8 +998,8 @@ Walk these to convince yourself a design is safe. "RGS retries" means an identic
 arrives again.
 
 **Scenario A - response lost after a successful debit.** You took the stake and committed, but
-your `2xx` never reached the RGS. RGS retries the debit. Your unique constraint on `round`
-(and/or `debit.id`) fires → you detect the replay → you read back the stored `debit_id` and
+your `2xx` never reached the RGS. RGS retries the debit. Your unique constraint on `debit.id`
+fires → you detect the replay → you read back the stored `debit_id` and
 current balance → return the *same* `2xx`. **One stake taken.** ✔
 
 **Scenario B - crash between moving money and recording the bet (separate balance, §7.2
@@ -1019,6 +1058,13 @@ Things that have bitten real integrations. Audit your implementation against eac
 - [ ] **Partitioning by `now()` instead of an operation-derived timestamp.** Breaks
       at-most-once: a retry crossing a partition boundary won't see the original and will
       double-apply. Derive the partition key from the id (`uuid_extract_timestamp`). (§7.3)
+- [ ] **Time-expiring sessions in your wallet.** Session lifetime is the RGS's to enforce (it
+      currently opens no new bets 24 hours after launch — subject to change). A wallet-side TTL —
+      rejecting calls on an old session, or deleting session rows on age — withholds wins and
+      strands cancelled stakes when a late debit, credit, or rollback arrives for an active
+      round. Validate credits/rollbacks against the **stored bet** (the token must resolve to
+      the same session that opened the round), and clean up a session only once it has **no
+      active bets** left. (§2, "Session lifetime")
 - [ ] **Money in floating point.** Integer micro-units end-to-end; 64-bit/decimal types. (§2)
 - [ ] **Currency mismatch not rejected.** Each money sub-object's currency must equal the
       session currency → `ERR_BAD` otherwise. (§2)

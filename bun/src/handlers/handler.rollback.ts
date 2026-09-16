@@ -1,5 +1,5 @@
 import type { FromSchema } from "json-schema-to-ts";
-import { ErrNotClosable, ErrNotFound } from "../db/errors";
+import { ErrNotClosable, ErrNotFound, ErrSessionMismatch } from "../db/errors";
 import { ErrBetComplete, ErrInvalidSession } from "./errors";
 import type { Handler, State } from "./routes";
 import { BalanceResponseSchema, UuidSchema } from "./schema";
@@ -57,14 +57,17 @@ type RollbackRequest = FromSchema<typeof schema.request>;
  *   - a debit that never arrived is tombstoned (rollback-before-debit) so its straggler debit is
  *     later fenced — nothing is refunded;
  *   - a round still mid-debit (a referenced debit is `pending`) is retryable (ErrConcurrent → 5xx);
- *   - a round already settled by a credit is terminal (ErrNotClosable → 4xx).
+ *   - a round already settled by a credit is terminal (ErrNotClosable → 4xx);
+ *   - a round opened by a DIFFERENT session is refused (ErrSessionMismatch → ERR_IS) — the bet's
+ *     recorded session is what authorizes a rollback.
  * Each refund is idempotent on the reversal's own minted id, so re-driving the batch converges.
  */
 export const rollbackHandler: Handler<State, RollbackRequest> = async ({ body, state }) => {
   const { repo, balance } = state;
 
-  // The session authenticates the token and supplies the user/currency to record an orphan
-  // tombstone and to report the balance.
+  // The session resolves the token and supplies the user/currency to record an orphan tombstone
+  // and to report the balance; the proc authorizes the rollback against the bet's recorded
+  // session below.
   const session = await repo.getSessionByToken(body.token).catch((err) => {
     if (err instanceof ErrNotFound) throw new ErrInvalidSession(body.token, err);
     throw err;
@@ -78,6 +81,7 @@ export const rollbackHandler: Handler<State, RollbackRequest> = async ({ body, s
     active: body.active ?? false,
   }).catch((err) => {
     if (err instanceof ErrNotClosable) throw new ErrBetComplete("round is not reversible (already settled)");
+    if (err instanceof ErrSessionMismatch) throw new ErrInvalidSession(body.token, err);
     throw err; // ErrConcurrent (a referenced debit mid-flight) propagates as a retryable 5xx
   });
 
