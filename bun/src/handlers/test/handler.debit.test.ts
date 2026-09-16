@@ -85,6 +85,19 @@ describe("debit", () => {
     expect(body.code).toBe("ERR_BNF");
   });
 
+  walletTest("accepts a debit on an old session — session lifetime is the RGS's to enforce", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    // The wallet never rejects on token age (contract §2, "Session lifetime"): the RGS decides
+    // when a session may no longer bet, and may send extra debits for an active round any time.
+    await sql`UPDATE repo.session SET created_at = now() - interval '25 hours' WHERE id = ${s.token}::uuid`;
+    const { status, body } = await call(
+      "/v1/debit",
+      signed({ token: s.token, round: 7, active: true, mode: "base", ip: "1.1.1.1", debit: { id: uuid(), amount: 10_000_000, currency: "USD" } }),
+    );
+    expect(status).toBe(200);
+    expect(body.balance.amount).toBe(90_000_000);
+  });
+
   walletTest("ERR_BAD when debit currency != session currency", async ({ call, session }) => {
     const s = await session(100_000_000, "USD");
     const { status, body } = await call(

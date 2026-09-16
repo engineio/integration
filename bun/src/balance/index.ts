@@ -4,9 +4,9 @@
  * remote service, a different store, or a mock without touching the handlers. This models
  * the common real-world shape where balances live in a separate account service.
  *
- * `transfer` is **idempotent**: each movement carries an `opKey` (the RGS transaction id),
- * and re-applying a key that was already settled is a no-op that returns the unchanged
- * balance. That property — not a shared transaction with the bet ledger — is what keeps
+ * `transfer` is **idempotent**: each movement carries an `opKey` (the wallet's own
+ * bet-ledger transaction id), and re-applying a key that was already settled is a no-op
+ * that returns the unchanged balance. That property — not a shared transaction with the bet ledger — is what keeps
  * the two stores consistent under the RGS's retries. `transfer` commits immediately and
  * returns the new available balance.
  */
@@ -24,8 +24,8 @@ export interface Transfer {
   credit: BalanceBucket;
   /** Source bucket (decremented). */
   debit: BalanceBucket;
-  /** Idempotency key — the RGS transaction id behind this movement. Re-applying the
-   *  same key is a no-op. */
+  /** Idempotency key — the bet-ledger transaction id behind this movement (a wallet-minted
+   *  UUIDv7, not the RGS id). Re-applying the same key is a no-op. */
   opKey: string;
 }
 

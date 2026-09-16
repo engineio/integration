@@ -1,6 +1,6 @@
 import { randomUUIDv7 as uuid } from "bun";
 import { describe, expect } from "bun:test";
-import { createSign } from "node:crypto";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { walletTest } from "./harness";
 import { signed, testPrivateKey } from "./helpers";
 
@@ -27,6 +27,32 @@ describe("auth", () => {
     expect(status).toBe(401);
     expect(body.code).toBe("ERR_ATE");
   });
+
+  walletTest("rejects a valid Ed25519 signature from the WRONG key", async ({ base }) => {
+    const raw = JSON.stringify({ token: uuid() });
+    const { privateKey: strangerKey } = generateKeyPairSync("ed25519");
+    const signature = sign(null, Buffer.from(raw), strangerKey).toString("base64");
+    const res = await fetch(`${base}/v1/balance`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-signature": signature },
+      body: raw,
+    });
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { code: string }).code).toBe("ERR_ATE");
+  });
+
+  walletTest("rejects a valid signature over DIFFERENT bytes (tampered body)", async ({ base }) => {
+    const signedBody = JSON.stringify({ token: uuid() });
+    const sentBody = JSON.stringify({ token: uuid() });
+    const signature = sign(null, Buffer.from(signedBody), testPrivateKey).toString("base64");
+    const res = await fetch(`${base}/v1/balance`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-signature": signature },
+      body: sentBody,
+    });
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { code: string }).code).toBe("ERR_ATE");
+  });
 });
 
 describe("request validation", () => {
@@ -44,7 +70,7 @@ describe("request validation", () => {
 
   walletTest("ERR_BAD on a (validly signed) non-JSON body", async ({ base }) => {
     const raw = "not json";
-    const signature = createSign("RSA-SHA256").update(raw).sign(testPrivateKey, "base64");
+    const signature = sign(null, Buffer.from(raw), testPrivateKey).toString("base64");
     const res = await fetch(`${base}/v1/balance`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-signature": signature },

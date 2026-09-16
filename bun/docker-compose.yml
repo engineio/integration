@@ -3,15 +3,16 @@
 #
 #   docker compose up --build
 #
-# First run generates an RSA keypair into ./keys/ (the RGS would normally hold the private
+# First run generates an Ed25519 keypair into ./keys/ (the RGS would normally hold the private
 # key — here you use it to sign test requests). Then:
 #
 #   # create a dev session (DEV_ENDPOINTS=true exposes this unauthenticated route)
 #   curl -s localhost:3000/v1/dev/session -d '{"currency":"USD","startingBalance":100000}'
 #
-#   # signed balance call
+#   # signed balance call (Ed25519 signs one-shot, so openssl needs the body in a file)
 #   BODY='{"token":"<token from above>"}'
-#   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -sign keys/private.key | base64 -w0)
+#   printf '%s' "$BODY" > /tmp/body.json
+#   SIG=$(openssl pkeyutl -sign -inkey keys/private.key -rawin -in /tmp/body.json | base64 -w0)
 #   curl -s localhost:3000/v1/balance -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"
 #
 # Notes on the shape of this file:
@@ -28,15 +29,16 @@ x-tigerbeetle: &tigerbeetle
   entrypoint: /bin/sh
 
 services:
-  # One-shot: generate the RGS keypair into ./keys/ if it isn't there yet.
+  # One-shot: generate the RGS keypair into ./keys/ if it isn't there yet. Regenerates a
+  # pair that isn't Ed25519 (e.g. an RSA pair left over from before the key migration).
   keygen:
     image: alpine/openssl
     entrypoint: /bin/sh
     command:
       - -c
       - |
-        [ -f /keys/private.key ] || {
-          openssl genrsa -out /keys/private.key 4096
+        openssl pkey -in /keys/private.key -noout -text 2>/dev/null | grep -qi ed25519 || {
+          openssl genpkey -algorithm ed25519 -out /keys/private.key
           openssl pkey -in /keys/private.key -pubout -out /keys/public.key
         }
         chmod 644 /keys/public.key

@@ -169,7 +169,7 @@ export class Repository {
    *  it. A NULL credit with `active = false` closes a losing/zero round. Atomic and committed on
    *  return. IDEMPOTENT on the credit ext_id — close_bet_v1 returns the stored credit on a replay
    *  rather than throwing; the returned credit_id is canonical (the freshly minted one below is used
-   *  only on first record). Throws ErrConcurrent if the first debit is still `pending`, ErrRoundClosed
+   *  only on first record). Throws ErrConcurrent if the first debit is still `pending`, ErrNotClosable
    *  (SEBNC) if a NEW credit lands on an already-closed round, and ErrNotFound (SEBNF) for an unknown
    *  round. */
   async closeBet(params: {
@@ -208,7 +208,8 @@ export class Repository {
    *  `amount` is the refunded stake, or 0 for a tombstone (an orphan rollback that arrived before
    *  its debit — the straggler is then fenced). IDEMPOTENT on each debit ref (a replay returns the
    *  existing rollback). Throws ErrConcurrent if a referenced debit is still `pending` (retry the
-   *  batch) and ErrNotClosable if the round is already closed. The round is closed unless `active`.
+   *  batch), ErrNotClosable if the round is already closed, and ErrSessionMismatch (SESMM) if the
+   *  session doesn't match the bet's recorded session. The round is closed unless `active`.
    *  An orphan rollback creates the bet from the session so the tombstone has a home. */
   async rollbackDebits(params: {
     round: number;

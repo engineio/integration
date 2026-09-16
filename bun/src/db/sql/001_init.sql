@@ -3,7 +3,7 @@ CREATE SCHEMA IF NOT EXISTS repo;
 
 CREATE TYPE repo.transaction_type AS ENUM ('debit', 'rollback', 'credit');
 
--- A bet is a CONTAINER for 1..N debits plus an optional single credit, recorded BEFORE money moves
+-- A bet is a CONTAINER for 1..N debits plus 0..N credits, recorded BEFORE money moves
 -- (bet-first), so the round can be fenced before any stake moves.
 --   pending — exists, but no debit has confirmed its stake yet (the first debit is mid-flight).
 --             Deleted entirely if that first/only debit can't be afforded.
@@ -46,6 +46,9 @@ CREATE TABLE repo.game (
 );
 CREATE INDEX idx_game_provider ON repo.game (provider);
 
+-- Sessions are never time-expired by the wallet (the RGS enforces session lifetime — contract
+-- §2, "Session lifetime"). Clean up a session only once it has no open bets left; this example
+-- keeps them forever.
 CREATE TABLE repo.session (
     id         uuid PRIMARY KEY, -- the session token the RGS sends
     "user"     int4 NOT NULL,

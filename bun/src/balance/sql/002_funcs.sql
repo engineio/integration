@@ -4,7 +4,7 @@
 -- a shared commit (see the handlers). The currency/buckets come in as varchar (cast to the
 -- enums here, so callers don't need them).
 --
--- Custom SQLSTATE (mapped to a typed error in balance/repo.ts):
+-- Custom SQLSTATE (mapped to ErrInsufficientBalance in balance/postgres.ts):
 --   SEIPB  insufficient player balance (`available` would go negative)
 
 -- Apply one double-entry movement, keyed by `p_op_key` for idempotency. The ledger row is

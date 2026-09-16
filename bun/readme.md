@@ -42,8 +42,9 @@ Postgres for the bet ledger, and a 3-replica TigerBeetle cluster for the balance
 docker compose up --build
 ```
 
-The first run generates an RSA keypair into `./keys/` (the RGS would normally hold the private
-key — here you use it to sign test requests). The wallet comes up on `:3000` with
+The first run generates an Ed25519 keypair into `./keys/` (the RGS would normally hold the
+private key — here you use it to sign test requests; an old RSA pair from a previous run is
+regenerated automatically). The wallet comes up on `:3000` with
 `DEV_ENDPOINTS=true`, so the [Making a request](#making-a-request) steps below work as-is
 (sign with `keys/private.key`). See the header comment in
 [docker-compose.yml](docker-compose.yml) for the details.
@@ -55,8 +56,8 @@ Alternatively, run the wallet directly (you provide Postgres):
 ```sh
 bun install
 
-# Generate an RSA keypair for local testing (the RGS would normally hold the private key):
-openssl genrsa -out private.key 4096
+# Generate an Ed25519 keypair for local testing (the RGS would normally hold the private key):
+openssl genpkey -algorithm ed25519 -out private.key
 openssl pkey -in private.key -pubout -out public.key
 
 export DATABASE_URL='postgres://postgres:postgres@localhost:5432/operator'
@@ -104,11 +105,12 @@ curl -s localhost:3000/v1/dev/session \
 ```
 
 Then sign a request body with the private key and call the wallet, e.g. the balance
-endpoint:
+endpoint (Ed25519 signs one-shot, so openssl needs the body in a file):
 
 ```sh
 BODY='{"token":"<token>"}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -sign private.key | base64 -w0)
+printf '%s' "$BODY" > /tmp/body.json
+SIG=$(openssl pkeyutl -sign -inkey private.key -rawin -in /tmp/body.json | base64 -w0)
 curl -s localhost:3000/v1/balance \
   -H 'content-type: application/json' \
   -H "x-signature: $SIG" \
@@ -170,17 +172,16 @@ src/
     sql/
       001_init.sql       repo schema + tables (bet [status lifecycle] / transaction)
       002_funcs.sql      record_debit/confirm/reject/close/rollback_debits/get_bet_v1 + maintain_bet_partitions
-      003_multi_credit.sql  multi-credit support
   balance/             the balance ledger - stands in for a separate account service
     index.ts           Balance interface + Transfer types + ErrInsufficientBalance
     postgres.ts        PostgresBalance: idempotent double-entry transfer() (Postgres)
     tigerbeetle.ts     TigerBeetleBalance: the same Balance interface on TigerBeetle
-    errors.ts          ErrInsufficientBalance
     sql/               (Postgres backend)
       001_init.sql       balance schema + tables (ledger keyed by op_key)
       002_funcs.sql      _move / transfer_v1 / reset_v1 / maintain_ledger_partitions
     test/
       container.ts        shared TigerBeetle testcontainer (format + start)
+      postgres.test.ts    standalone PostgresBalance tests (op-key guard, partition maintenance)
       tigerbeetle.test.ts standalone TigerBeetleBalance tests
 ```
 
@@ -243,7 +244,8 @@ the *where*.
 | **Error codes → HTTP status, terminal vs retryable** ([§2](../readme.md#error-response-contract), [§3](../readme.md#3-status-codes-are-your-safety-mechanism)) | [handlers/errors.ts](src/handlers/errors.ts) - `WalletError` codes and `toErrorResponse()`. |
 | **Request validation lenient, response validation strict** (hardening practice: unknown inbound fields are ignored for forward-compat; own responses are strictly checked) | AJV schemas per handler; response validation hard-fails only outside production ([routes.ts](src/handlers/routes.ts)). |
 | **Idempotency enforced by DB constraints** ([§4](../readme.md#4-idempotency-no-duplicate-bets-no-duplicate-transactions)) | [db/sql/001_init.sql](src/db/sql/001_init.sql): round is the bet's `PRIMARY KEY`, transaction ids are `UNIQUE`. The `*_v1` procs return the canonical stored ids on replay. |
-| **Balance idempotency keyed by a UUIDv7 you mint** ([§7.2a](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | Balance movements key on `op_key` (a `UNIQUE` index in `src/balance/sql`) - the wallet's own bet-ledger transaction id, minted as a UUIDv7, *not* the RGS id. |
+| **Session lifetime is the RGS's to enforce; wallet auth is session-to-bet alignment** ([§2 Session lifetime](../readme.md#session-lifetime)) | No handler checks token age. [handler.credit.ts](src/handlers/handler.credit.ts) and `rollback_debits_v1` ([db/sql/002_funcs.sql](src/db/sql/002_funcs.sql)) verify the token against the bet's recorded session (`ERR_IS` on mismatch); sessions are cleaned up only once no active bets remain (this example keeps them forever — see [001_init.sql](src/db/sql/001_init.sql)). |
+| **Balance idempotency keyed by a UUIDv7 you mint** ([§7.2a](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | Balance movements key on `op_key` (the `PRIMARY KEY (op_key, op_ts)` in `src/balance/sql`) - the wallet's own bet-ledger transaction id, minted as a UUIDv7, *not* the RGS id. |
 | **Bet-first ordering: record `pending` → move money → `confirm`** ([§7.2b](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | [handler.debit.ts](src/handlers/handler.debit.ts) (debit), [handler.credit.ts](src/handlers/handler.credit.ts) (settle), [handler.rollback.ts](src/handlers/handler.rollback.ts) (reverse), over the `repo` procs in [db/sql/002_funcs.sql](src/db/sql/002_funcs.sql). |
 | **Delete only a never-funded `pending` bet** ([§7.2b](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | The debit handler deletes the `pending` debit (and empty bet) only on insufficient funds, guarded on the debit still being `pending`. |
 | **Fence a rollback that names an unseen debit (tombstone)** ([§7.2d](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case), [§6.5](../readme.md#65-rollback-reverse-one-or-more-debits)) | The rollback proc records a tombstone; `record_debit` refuses a fenced debit before any money moves. Exercised in [handler.ordering.test.ts](src/handlers/test/handler.ordering.test.ts). |

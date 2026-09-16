@@ -16,6 +16,15 @@ describe("balance", () => {
     expect(status).toBe(400);
     expect(body.code).toBe("ERR_IS");
   });
+
+  walletTest("an old session still resolves — the wallet never time-expires sessions", async ({ call, session, sql }) => {
+    const s = await session(500_000_000);
+    // Session lifetime is the RGS's to enforce, not the wallet's (contract §2, "Session lifetime").
+    await sql`UPDATE repo.session SET created_at = now() - interval '25 hours' WHERE id = ${s.token}::uuid`;
+    const { status, body } = await call("/v1/balance", signed({ token: s.token }));
+    expect(status).toBe(200);
+    expect(body.balance.amount).toBe(500_000_000);
+  });
 });
 
 describe("ledger partitioning", () => {

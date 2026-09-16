@@ -65,11 +65,22 @@ export class ErrDebitFenced extends ErrDatabase {
   }
 }
 
-/** A debit (or credit) arrived for a round that is already closed. Terminal — nothing after closed. */
+/** A debit arrived for a round that is already closed (a credit/rollback on a closed round is
+ *  ErrNotClosable). Terminal — nothing after closed. */
 export class ErrRoundClosed extends ErrDatabase {
   constructor(message = "round closed", cause?: unknown) {
     super(message, cause);
     this.name = "ErrRoundClosed";
+  }
+}
+
+/** The request's session doesn't match the session recorded on the round's bet. Terminal — the
+ *  bet record is the authority for credits/rollbacks, so a mismatched token must never settle
+ *  or reverse another session's round. */
+export class ErrSessionMismatch extends ErrDatabase {
+  constructor(message = "session mismatch", cause?: unknown) {
+    super(message, cause);
+    this.name = "ErrSessionMismatch";
   }
 }
 
@@ -94,14 +105,14 @@ export function intoRepoError(error: unknown): never {
       throw new ErrNotFound("bet not found", error);
     case "SEBNC": // stored proc: round already closed (a new credit/rollback can't land on it)
       throw new ErrNotClosable("round already closed", error);
-    case "SECRD": // stored proc: legacy "second credit" code — no longer raised (rounds hold 0..N credits)
-      throw new ErrNotClosable("round already settled by a different credit", error);
     case "SEIPB": // stored proc: insufficient player balance
       throw new ErrInsufficientBalance("insufficient balance", error);
     case "SEFEN": // stored proc: this debit was fenced by a prior rollback (rollback-before-debit)
       throw new ErrDebitFenced("debit fenced", error);
     case "SECLO": // stored proc: round closed (nothing after closed)
       throw new ErrRoundClosed("round closed", error);
+    case "SESMM": // stored proc: session doesn't match the bet's recorded session
+      throw new ErrSessionMismatch("session mismatch", error);
     default:
       throw error;
   }

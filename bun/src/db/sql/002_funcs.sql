@@ -5,23 +5,33 @@
 --
 -- The flow is BET-FIRST: a debit records the bet (and its debit transaction, as `pending`) BEFORE
 -- moving money, then `confirm`s the debit once the stake is taken (or `reject`s — deletes — it if
--- the stake can't be afforded). A bet is a CONTAINER: it holds 1..N debits (each its own
--- transaction, idempotent on its ext_id) plus an optional single credit. The idempotency unit is
--- the DEBIT, not the round — a NEW ext_id on an open bet ADDS a debit; a replayed ext_id returns
--- the stored one. Every handler keys the balance on its own bet-ledger transaction id, so there is
--- no separate idempotency-key table.
+-- the stake can't be afforded). A bet is a CONTAINER: it holds 1..N debits plus 0..N credits, each
+-- its own transaction, idempotent on its ext_id. The idempotency unit is the TRANSACTION, not the
+-- round — a NEW ext_id on an open bet ADDS a debit/credit; a replayed ext_id returns the stored
+-- one. An `active = false` flag (on a debit, credit, or rollback) closes the round. Every handler
+-- keys the balance on its own bet-ledger transaction id, so there is no separate
+-- idempotency-key table.
+--
+-- The wallet never time-expires sessions — session lifetime is the RGS's to enforce — and a late
+-- credit or rollback can arrive long after launch (contract §2, "Session lifetime"). What
+-- authorizes them is ALIGNMENT: the request's session must be the session recorded on the
+-- round's bet. The credit handler enforces this against get_bet_v1; rollback_debits_v1 enforces
+-- it inline (SESMM), which also covers a tombstone-only bet that get_bet_v1 deliberately reports
+-- as not-found.
 --
 -- `lock_timeout` is a small finite value (NOT 0 — Postgres treats 0 as "wait forever"). On a
 -- contended row the statement aborts with SQLSTATE 55P03, which db/errors.ts maps to ErrConcurrent
 -- and the handler surfaces as a retryable 5xx so the RGS retries.
 --
 -- Custom SQLSTATE codes (mapped to typed errors in db/errors.ts):
---   SEBAD  bad request (non-positive amount)
+--   SEBAD  bad request (non-positive amount) — defense-in-depth only: the handlers' schema
+--          validation rejects these first, so it has no db/errors.ts mapping (an unexpected
+--          hit surfaces as a generic 500)
 --   SEBNF  bet not found
 --   SEBNC  bet not closable / not reversible (already settled by a credit)
 --   SECLO  round closed — nothing happens to a closed bet (refuse a debit)
---   SECRD  a different credit already settled this round (only one credit per round)
 --   SEFEN  this debit was fenced — a rollback referenced it before it arrived; refuse the straggler
+--   SESMM  session mismatch — the request's session isn't the one recorded on the bet (→ ERR_IS)
 --   55P03  (also raised deliberately) a debit is mid-flight (`pending`), or the bet's first debit
 --          has not confirmed yet — retry
 
@@ -29,8 +39,9 @@
 -- container: the FIRST debit opens it `pending`; later debits (a NEW ext_id) are APPENDED while it
 -- is open. IDEMPOTENT on the debit's ext_id: a replay returns the originally stored ids and moves
 -- no money. Refuses a debit whose ext_id a rollback already fenced (SEFEN — the straggler case) and
--- a debit on a `closed` round (SECLO). An optional concurrent credit becomes the round's single
--- credit (a second one raises SECRD). Runs before any money moves.
+-- a debit on a `closed` round (SECLO). An optional concurrent credit (e.g. a buy-feature settling
+-- its win in the same call) is appended like any other credit — the round may already hold others.
+-- Runs before any money moves.
 CREATE OR REPLACE FUNCTION repo.record_debit_v1(
     p_id            int8,
     p_session       uuid,
@@ -106,11 +117,8 @@ BEGIN
     INSERT INTO repo.transaction (id, bet_id, type, status, amount, ext_id, reference)
     VALUES (p_debit_id, p_id, 'debit', 'pending', p_amount, p_debit_ext_id, NULL);
 
-    -- 5. Optional concurrent credit — the round's single credit. A second credit is refused.
+    -- 5. Optional concurrent credit, appended like any other; idempotent on the credit ext_id.
     IF p_credit_id IS NOT NULL THEN
-        IF EXISTS (SELECT 1 FROM repo.transaction c WHERE c.bet_id = p_id AND c.type = 'credit') THEN
-            RAISE EXCEPTION USING ERRCODE = 'SECRD';
-        END IF;
         INSERT INTO repo.transaction (id, bet_id, type, amount, ext_id, reference)
         VALUES (p_credit_id, p_id, 'credit', p_payout, p_credit_ext_id, p_debit_ext_id);
     END IF;
@@ -160,16 +168,19 @@ BEGIN
 END;
 $$;
 
--- Close a round and record its single win credit (a NULL credit is a losing/zero round), returning
--- the canonical credit id. IDEMPOTENT on the round: a replay reads back the settled credit. A round
--- whose first debit is still `pending` raises 55P03 (retry). A second, DIFFERENT credit raises
--- SECRD (only one credit per round). SEBNF for an unknown round.
+-- Add a credit to the round (idempotent on its ext_id) and close the round iff p_active is false.
+-- A NULL credit with p_active=false closes a losing/zero round; a NULL credit with p_active=true is
+-- a no-op that just reports the bet. A round holds 0..N credits: a NEW ext_id appends another while
+-- the round is open; a replay returns the stored id (even on a closed round). A NEW credit on an
+-- already-closed round is refused (SEBNC). A round whose first debit is still `pending` raises
+-- 55P03 (retry). SEBNF for an unknown round.
 CREATE OR REPLACE FUNCTION repo.close_bet_v1(
     p_id            int8,
     p_credit_id     uuid,
     p_credit_amount int8,
     p_credit_ext_id uuid,
-    p_credit_ref    uuid
+    p_credit_ref    uuid,
+    p_active        boolean
 )
 RETURNS TABLE (
     credit_id      uuid,
@@ -185,9 +196,8 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_bet          repo.bet%ROWTYPE;
-    v_credit_id    uuid;
-    v_existing_ext uuid;
+    v_bet       repo.bet%ROWTYPE;
+    v_credit_id uuid;
 BEGIN
     SET LOCAL lock_timeout = '1s';
 
@@ -200,28 +210,33 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '55P03';
     END IF;
 
-    -- Existing credit? Enforces both idempotency (same ext_id → replay) and the single-credit rule
-    -- (different ext_id → refuse).
-    SELECT c.id, c.ext_id INTO v_credit_id, v_existing_ext
-    FROM repo.transaction c WHERE c.bet_id = p_id AND c.type = 'credit';
+    -- Record the credit, if one was sent. Idempotent on the credit's ext_id (UNIQUE per round): a
+    -- replay returns the stored id and moves no money; a NEW ext_id appends another credit. A new
+    -- credit on an already-closed round is refused (nothing happens to a closed round).
+    IF p_credit_ext_id IS NOT NULL THEN
+        SELECT c.id INTO v_credit_id
+        FROM repo.transaction c
+        WHERE c.bet_id = p_id AND c.type = 'credit' AND c.ext_id = p_credit_ext_id;
 
-    IF v_credit_id IS NOT NULL THEN
-        IF p_credit_ext_id IS NOT NULL AND p_credit_ext_id <> v_existing_ext THEN
-            RAISE EXCEPTION USING ERRCODE = 'SECRD';
+        IF v_credit_id IS NULL THEN
+            IF v_bet.status = 'closed' THEN
+                RAISE EXCEPTION USING ERRCODE = 'SEBNC';
+            END IF;
+            INSERT INTO repo.transaction (id, bet_id, type, amount, ext_id, reference)
+            VALUES (p_credit_id, p_id, 'credit', COALESCE(p_credit_amount, 0), p_credit_ext_id, p_credit_ref);
+            v_credit_id := p_credit_id;
         END IF;
-        -- else: replay — return the stored credit id.
-    ELSIF p_credit_ext_id IS NOT NULL THEN
-        INSERT INTO repo.transaction (id, bet_id, type, amount, ext_id, reference)
-        VALUES (p_credit_id, p_id, 'credit', COALESCE(p_credit_amount, 0), p_credit_ext_id, p_credit_ref);
-        v_credit_id := p_credit_id;
     END IF;
 
-    -- Close if still open (idempotent — a re-drive over an already-closed round flips nothing).
-    UPDATE repo.bet b SET status = 'closed', updated_at = now()
-    WHERE b.id = p_id AND b.status = 'open'
-    RETURNING * INTO v_bet;
-    IF NOT FOUND THEN
-        SELECT * INTO v_bet FROM repo.bet WHERE id = p_id;
+    -- Close the round unless the RGS is keeping it open for more debits/credits (idempotent — a
+    -- re-drive over an already-closed round flips nothing).
+    IF NOT p_active THEN
+        UPDATE repo.bet b SET status = 'closed', updated_at = now()
+        WHERE b.id = p_id AND b.status = 'open'
+        RETURNING * INTO v_bet;
+        IF NOT FOUND THEN
+            SELECT * INTO v_bet FROM repo.bet WHERE id = p_id;
+        END IF;
     END IF;
 
     RETURN QUERY SELECT
@@ -236,6 +251,8 @@ $$;
 -- which Bun double-encodes into a scalar; a plain JS array cast `::jsonb` binds correctly). Each
 -- item { ref, id, ext } reverses the debit named by `ref`, returning the canonical rollback id and
 -- refunded amount IN INPUT ORDER. Per item:
+--   * the session doesn't match the bet's recorded session → RAISE SESMM before anything moves
+--     (alignment, not token liveness, authorizes a rollback — see the file header)
 --   * already reversed (replay, or a prior tombstone)  → return the existing rollback (idempotent
 --     on the debit ref — also guards a double-rollback)
 --   * the referenced debit never arrived               → write a 0-amount TOMBSTONE referencing it,
@@ -245,7 +262,7 @@ $$;
 --   * otherwise                                        → reverse it (refund the debit's amount)
 -- The round is then closed UNLESS p_active is true (the RGS keeping it open for its other debits).
 -- An orphan rollback (no bet yet) creates the bet `pending` from the session so the tombstone has a
--- home; a different debit can still open the round normally.
+-- home — alignment is then true by construction; a different debit can still open the round normally.
 CREATE OR REPLACE FUNCTION repo.rollback_debits_v1(
     p_id       int8,
     p_session  uuid,
@@ -263,6 +280,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_bet_status   repo.bet_status;
+    v_bet_session  uuid;
     v_item         jsonb;
     v_ref          uuid;
     v_rb_id        uuid;
@@ -279,7 +297,13 @@ BEGIN
     VALUES (p_id, p_session, p_user, p_game, p_currency::repo.currency, 'pending')
     ON CONFLICT (id) DO NOTHING;
 
-    SELECT status INTO v_bet_status FROM repo.bet WHERE id = p_id;
+    SELECT status, session INTO v_bet_status, v_bet_session FROM repo.bet WHERE id = p_id;
+
+    -- Every call for a round carries the session that opened it. A rollback whose session doesn't
+    -- match the bet's recorded session is refused BEFORE anything is reversed (SESMM → ERR_IS).
+    IF v_bet_session <> p_session THEN
+        RAISE EXCEPTION USING ERRCODE = 'SESMM';
+    END IF;
 
     FOR v_item IN SELECT value FROM jsonb_array_elements(p_items) LOOP
         v_ref    := (v_item->>'ref')::uuid;
@@ -329,35 +353,27 @@ BEGIN
 END;
 $$;
 
--- Read a bet and its single credit (if any). Gated on EXISTS(debit): a round with no debit — only a
--- rollback tombstone (orphan) — reads back as not-found, so a credit for it returns ERR_BNF (credits
--- never fence a round; only a rollback does). Returns one row regardless of how many debits the bet
--- holds.
+-- Read a bet. A round holds 0..N credits, so this returns just the bet — the credit handler only
+-- needs it to validate session + currency + that the round exists. Gated on EXISTS(debit): a round
+-- with no debit — only a rollback tombstone (orphan) — reads back as not-found, so a credit for it
+-- returns ERR_BNF (credits never fence a round; only a rollback does).
 CREATE OR REPLACE FUNCTION repo.get_bet_v1(p_id int8)
 RETURNS TABLE (
-    bet_id            int8,
-    bet_session       uuid,
-    bet_status        repo.bet_status,
-    bet_user          integer,
-    bet_game          integer,
-    bet_currency      repo.currency,
-    bet_created_at    timestamptz,
-    bet_updated_at    timestamptz,
-    credit_id         uuid,
-    credit_amount     int8,
-    credit_ext_id     uuid,
-    credit_reference  uuid,
-    credit_created_at timestamptz
+    bet_id         int8,
+    bet_session    uuid,
+    bet_status     repo.bet_status,
+    bet_user       integer,
+    bet_game       integer,
+    bet_currency   repo.currency,
+    bet_created_at timestamptz,
+    bet_updated_at timestamptz
 )
 LANGUAGE plpgsql
 AS $$
 BEGIN
     RETURN QUERY
-    SELECT
-        b.id, b.session, b.status, b."user", b.game, b.currency, b.created_at, b.updated_at,
-        c.id, c.amount, c.ext_id, c.reference, c.created_at
+    SELECT b.id, b.session, b.status, b."user", b.game, b.currency, b.created_at, b.updated_at
     FROM repo.bet b
-    LEFT JOIN repo.transaction c ON c.bet_id = b.id AND c.type = 'credit'
     WHERE b.id = p_id
       AND EXISTS (SELECT 1 FROM repo.transaction d WHERE d.bet_id = b.id AND d.type = 'debit');
 END;
