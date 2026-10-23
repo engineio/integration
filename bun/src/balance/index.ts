@@ -27,10 +27,16 @@ export interface Transfer {
   /** Idempotency key — the bet-ledger transaction id behind this movement (a wallet-minted
    *  UUIDv7, not the RGS id). Re-applying the same key is a no-op. */
   opKey: string;
+  /** Let this movement take `available` below zero — a clawback of a reversed win, which must
+   *  land whatever the player has left. Any other movement that debits `available` fails with
+   *  ErrInsufficientBalance when it can't be covered, and while `available` is negative every
+   *  such debit fails. */
+  overdraw?: boolean;
 }
 
 export interface Balance {
-  /** A player's spendable (`available`) balance for a currency. */
+  /** A player's spendable (`available`) balance for a currency. Negative after a clawback the
+   *  player couldn't cover; how to recover that is the operator's business decision. */
   get(userId: number, currency: string): Promise<number>;
   /** Apply 1–2 double-entry movements for a single player and return the new available
    *  balance. Idempotent per movement `opKey`; commits immediately. */

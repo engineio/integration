@@ -2,7 +2,7 @@ import Ajv from "ajv";
 import { verify, type KeyObject } from "node:crypto";
 import type { Balance } from "../balance";
 import type { Repository } from "../db/repo";
-import { ErrBadAuth, ErrBadRequest, ErrGeneralError, toErrorResponse } from "./errors";
+import { ErrBadAuth, ErrBadRequest, ErrUnknownError, toErrorResponse } from "./errors";
 import { balanceHandler, schema as balanceSchema } from "./handler.balance";
 import { creditHandler, schema as creditSchema } from "./handler.credit";
 import { debitHandler, schema as debitSchema } from "./handler.debit";
@@ -12,9 +12,7 @@ import { devSessionRoute } from "./handler.session";
 
 // One AJV instance; route() compiles each schema once at startup.
 const ajv = new Ajv({ allErrors: true });
-// AJV ships no formats by default; register just `uuid` (any version) so the `format: "uuid"` in
-// our request schemas (UuidSchema) validates id/token fields. We don't pin UUIDv7 here — the RGS
-// isn't required to send v7; that invariant is enforced internally on the key we mint.
+// AJV ships no formats by default; register just `uuid` (any version) for UuidSchema (see schema.ts).
 ajv.addFormat("uuid", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 
 export type Handler<State, B> = (ctx: {
@@ -90,11 +88,11 @@ function createRouter<S extends State>(state: S) {
           if (payload && !validateResponse(payload)) {
             state.log("error", "response schema mismatch", { path, errors: validateResponse.errors });
             // Dev: hard-fail to catch contract drift. Prod: log and pass through —
-            // a debit/credit may already be committed, so 500-ing would invite a
-            // retry and risk a double-spend.
+            // a debit/credit may already be committed, and a 500 (ERR_UE) would make
+            // the RGS reverse that debit or keep re-sending that credit.
             if (process.env.NODE_ENV !== "production") {
               status = 500;
-              return new ErrGeneralError("response validation failed").toResponse();
+              return new ErrUnknownError("response validation failed").toResponse();
             }
           }
         }

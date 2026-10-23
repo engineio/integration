@@ -41,6 +41,8 @@ export interface Ctx {
   session: (startingBalance?: number, currency?: string) => Promise<{ token: string; user: number; currency: string }>;
   /** Direct DB handle for assertions that need to inspect storage (e.g. partition routing). */
   sql: SQL;
+  /** The balance store, for staging money that moved before a simulated crash. */
+  balance: Balance;
 }
 
 /**
@@ -91,7 +93,7 @@ export function walletTest(name: string, body: (ctx: Ctx) => Promise<void>, opts
         };
 
         try {
-          await body({ base, call, session, sql });
+          await body({ base, call, session, sql, balance });
         } finally {
           await server.stop(true);
           await destroy();

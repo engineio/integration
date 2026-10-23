@@ -40,7 +40,8 @@ export class PostgresBalance implements Balance {
    * immediately, returning the new available balance. Idempotent per movement `opKey`: a
    * replay re-sends the same keys and applies nothing. The function applies
    * available-debits before available-credits, so a same-batch win can never fund the
-   * stake (e.g. $5 balance, $10 stake, $20 win is rejected, not netted to +$10).
+   * stake (e.g. $5 balance, $10 stake, $20 win is rejected, not netted to +$10). An
+   * `overdraw` movement skips the affordability guard and may take available negative.
    */
   async transfer(movements: [Transfer] | [Transfer, Transfer]): Promise<number> {
     const [m1, m2] = movements;
@@ -55,10 +56,10 @@ export class PostgresBalance implements Balance {
     const [row] = await this.sql`
       SELECT balance.transfer_v1(
         ${userId}, ${currency},
-        ${m1.debit}, ${m1.credit}, ${m1.amount}, ${m1.opKey}::uuid,
-        ${m2?.debit ?? null}, ${m2?.credit ?? null}, ${m2?.amount ?? null}, ${m2?.opKey ?? null}::uuid
+        ${m1.debit}, ${m1.credit}, ${m1.amount}, ${m1.opKey}::uuid, ${m1.overdraw ?? false},
+        ${m2?.debit ?? null}, ${m2?.credit ?? null}, ${m2?.amount ?? null}, ${m2?.opKey ?? null}::uuid, ${m2?.overdraw ?? false}
       ) AS amount`.catch((err) => {
-      // The function raises SQLSTATE SEIPB when `available` can't cover a debit.
+      // The function raises SQLSTATE SEIPB when `available` can't cover a non-overdraw debit.
       if ((err as { errno?: unknown } | null)?.errno === "SEIPB") throw new ErrInsufficientBalance();
       throw err;
     });

@@ -2,7 +2,7 @@ import type { FromSchema } from "json-schema-to-ts";
 import { ErrNotFound } from "../db/errors";
 import { ErrInvalidSession } from "./errors";
 import type { Handler, State } from "./routes";
-import { BalanceResponseSchema, UuidSchema } from "./schema";
+import { BalanceResponseSchema, TokenSchema } from "./schema";
 
 export const schema = {
   request: {
@@ -11,7 +11,7 @@ export const schema = {
     // Ignore unknown inbound fields: the RGS may add request fields over time, and a
     // strict wallet would 400 the day it does. Responses (below / elsewhere) stay strict.
     additionalProperties: true,
-    properties: { token: UuidSchema },
+    properties: { token: TokenSchema },
   },
   response: {
     type: "object",

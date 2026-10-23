@@ -10,10 +10,14 @@ import type { FromSchema } from "json-schema-to-ts";
  */
 export const UuidSchema = { type: "string", format: "uuid" } as const;
 
+/** The session token: opaque on the wire, so it isn't shape-checked here — a token we never
+ *  issued, whatever it looks like, is ERR_IS (a non-UUID one fails the lookup's cast). */
+export const TokenSchema = { type: "string" } as const;
+
 /**
- * Currencies the Engine RGS may send. This is the wire contract; the wallet
- * stores and returns amounts in the player's currency as integer micro-units
- * (1_000_000 = 1.00 of the currency).
+ * Currencies this example supports — a subset of Engine's list. The RGS sends the
+ * currency the session was launched with, so launch (and run the conformance suite)
+ * only in these. Amounts are integer micro-units (1_000_000 = 1.00 of the currency).
  */
 export const EngineCurrencySchema = {
   type: "string",

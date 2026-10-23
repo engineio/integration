@@ -67,7 +67,9 @@ export DEV_ENDPOINTS=true
 bun run dev
 ```
 
-The wallet listens on `PORT` (default `3000`) and exposes a `GET /health` check.
+The wallet listens on `PORT` (default `3000`). `GET /health` is a liveness check for your
+own orchestrator (the docker-compose healthcheck uses it); it isn't part of the RGS contract,
+and the RGS never calls it.
 
 ### Optional: TigerBeetle balance backend
 
@@ -100,7 +102,7 @@ up each test — see the [conformance suite note](../readme.md#the-conformance-s
 ```sh
 curl -s localhost:3000/v1/dev/session \
   -H 'content-type: application/json' \
-  -d '{"currency":"USD","startingBalance":1000000000}'
+  -d '{"currency":"USD","balance":1000000000}'
 # => { "token": "...", "player": ..., "currency": "USD", "balance": 1000000000 }
 ```
 
@@ -137,7 +139,7 @@ the contract; see [How this example implements the contract](#how-this-example-i
 | `DATABASE_URL`  | yes      | -            | Postgres connection string (the bet ledger; also the Postgres balance ledger). |
 | `RGS_PUBLIC_KEY`| yes      | -            | base64 of the RGS public-key PEM.                        |
 | `PORT`          | no       | `3000`       | Wallet HTTP port.                                        |
-| `DB_POOL_MAX`   | no       | `10`         | Max Postgres connections.                                |
+| `DB_POOL_MAX`   | no       | `10`         | Max Postgres connections per pool (the bet ledger and the Postgres balance ledger each have one). |
 | `DEV_ENDPOINTS` | no       | `false`      | `true` exposes `POST /v1/dev/session` (no auth).         |
 | `BALANCE_BACKEND` | no     | `postgres`   | `postgres` or `tigerbeetle`.                             |
 | `TB_ADDRESS`    | no       | `3000`       | TigerBeetle address (numeric `IP:port`); used when `BALANCE_BACKEND=tigerbeetle`. |
@@ -163,7 +165,7 @@ src/
     handler.balance.ts   POST /v1/balance
     handler.debit.ts     POST /v1/debit   (bet-first: open pending → stake → confirm)
     handler.credit.ts    POST /v1/credit  (settle an open round)
-    handler.rollback.ts  POST /v1/rollback (reverse named debits; tombstone an orphan; close iff !active)
+    handler.rollback.ts  POST /v1/rollback (settle pending debits; refund named debits / claw back named credits; tombstone an orphan; close iff !active)
     handler.session.ts   DEV-only: seed/fund a player + mint a session (gated)
     test/                handler tests (testcontainers Postgres + TigerBeetle)
   db/                  the bet ledger (schema `repo`)
@@ -171,7 +173,7 @@ src/
     errors.ts          Postgres/SQLSTATE → typed errors
     sql/
       001_init.sql       repo schema + tables (bet [status lifecycle] / transaction)
-      002_funcs.sql      record_debit/confirm/reject/close/rollback_debits/get_bet_v1 + maintain_bet_partitions
+      002_funcs.sql      record_debit/confirm/reject/close_bet/rollback/get_bet_v1 + maintain_bet_partitions
   balance/             the balance ledger - stands in for a separate account service
     index.ts           Balance interface + Transfer types + ErrInsufficientBalance
     postgres.ts        PostgresBalance: idempotent double-entry transfer() (Postgres)
@@ -180,9 +182,10 @@ src/
       001_init.sql       balance schema + tables (ledger keyed by op_key)
       002_funcs.sql      _move / transfer_v1 / reset_v1 / maintain_ledger_partitions
     test/
-      container.ts        shared TigerBeetle testcontainer (format + start)
-      postgres.test.ts    standalone PostgresBalance tests (op-key guard, partition maintenance)
-      tigerbeetle.test.ts standalone TigerBeetleBalance tests
+      container.ts        shared TigerBeetle + Postgres balance testcontainers
+      balance.test.ts     the Balance contract (stakes, refunds, clawbacks into a negative balance) on both backends
+      postgres.test.ts    PostgresBalance's op-key guard
+      tigerbeetle.test.ts TigerBeetleBalance's `owed` debt mapping
 ```
 
 ## The HTTP pipeline
@@ -199,8 +202,9 @@ verify x-signature  →  parse + validate body  →  handler  →  validate resp
 
 The handler owns the money logic; the wrapper does not. Response validation **hard-fails
 (500) outside production** to catch contract drift, but in **production it logs and passes
-the response through** - a debit/credit may already be committed, so 500-ing would invite a
-retry and risk a double-spend. (Production is detected via `NODE_ENV=production`.)
+the response through** - a debit/credit may already be committed, and a 500 (`ERR_UE`) would
+make the RGS reverse that debit or keep re-sending that credit. (Production is detected via
+`NODE_ENV=production`.)
 
 ## Two ledgers
 
@@ -222,10 +226,12 @@ touching the handlers. Two implementations ship side by side, selected by `BALAN
 - **`tigerbeetle`** - `TigerBeetleBalance`, the same model on
   [TigerBeetle](https://tigerbeetle.com). It maps almost 1:1 (one ledger per currency, an
   account per bucket, the `op_key` UUID as the transfer id for idempotency, a
-  `debits_must_not_exceed_credits` flag for the overdraw guard, linked transfers for the
-  atomic stake+win batch) - so most of the Postgres ledger's hand-rolled machinery
-  (partitioning, the idempotency claim, the negative-balance `CHECK`) becomes native. See
-  the file's header comment for the full mapping and the one behavioural difference around
+  `debits_must_not_exceed_credits` flag for the insufficient-funds guard, linked transfers for
+  the atomic stake+win batch) - so most of the Postgres ledger's hand-rolled machinery
+  (partitioning, the idempotency claim, the guard on debits of `available`) becomes native.
+  The one thing that flag can't do is let a clawback go negative, so a debt the player can't
+  cover goes on a per-player `owed` account that later credits repay first. See the file's
+  header comment for the full mapping and the one behavioural difference around
   failed-transfer replays.
 
 The two stores are **never joined and share no transaction**. Because that is exactly the
@@ -240,16 +246,20 @@ the *where*.
 
 | Contract rule | Where it lives here |
 | ------------- | ------------------- |
-| **Signature check before parsing** ([§2 Authentication](../readme.md#authentication)) | [routes.ts](src/handlers/routes.ts) verifies `x-signature` over the raw body bytes as the first step, before `JSON.parse`. |
-| **Error codes → HTTP status, terminal vs retryable** ([§2](../readme.md#error-response-contract), [§3](../readme.md#3-status-codes-are-your-safety-mechanism)) | [handlers/errors.ts](src/handlers/errors.ts) - `WalletError` codes and `toErrorResponse()`. |
+| **Signature check before parsing** ([§2 Authentication](../readme.md#authentication)) | [routes.ts](src/handlers/routes.ts) verifies `x-signature` over the raw body bytes as the first step, before `JSON.parse`. This example serves a single operator, so it ignores `x-operator`. |
+| **Error codes → HTTP status; unknown failures are `ERR_UE`** ([§2](../readme.md#error-response-contract), [§3](../readme.md#3-status-codes-are-your-safety-mechanism)) | [handlers/errors.ts](src/handlers/errors.ts) - `WalletError` codes and `toErrorResponse()`. |
 | **Request validation lenient, response validation strict** (hardening practice: unknown inbound fields are ignored for forward-compat; own responses are strictly checked) | AJV schemas per handler; response validation hard-fails only outside production ([routes.ts](src/handlers/routes.ts)). |
-| **Idempotency enforced by DB constraints** ([§4](../readme.md#4-idempotency-no-duplicate-bets-no-duplicate-transactions)) | [db/sql/001_init.sql](src/db/sql/001_init.sql): round is the bet's `PRIMARY KEY`, transaction ids are `UNIQUE`. The `*_v1` procs return the canonical stored ids on replay. |
-| **Session lifetime is the RGS's to enforce; wallet auth is session-to-bet alignment** ([§2 Session lifetime](../readme.md#session-lifetime)) | No handler checks token age. [handler.credit.ts](src/handlers/handler.credit.ts) and `rollback_debits_v1` ([db/sql/002_funcs.sql](src/db/sql/002_funcs.sql)) verify the token against the bet's recorded session (`ERR_IS` on mismatch); sessions are cleaned up only once no active bets remain (this example keeps them forever — see [001_init.sql](src/db/sql/001_init.sql)). |
+| **Idempotency enforced by DB constraints** ([§4](../readme.md#4-idempotency-no-duplicate-bets-no-duplicate-transactions)) | [db/sql/001_init.sql](src/db/sql/001_init.sql): round is the bet's `PRIMARY KEY` (one operator, so round alone is unique), transaction ids are `UNIQUE`. The `*_v1` procs return the canonical stored ids on replay. |
+| **Integer micro-units, never floats** ([§2 Money representation](../readme.md#money-representation)) | Amounts are validated as integers but carried as JS `number`, exact only to 2^53 micro-units (~9 billion units) - fine for this example, not for a production wallet with large IDR/VND balances: carry amounts as `BigInt` there. |
+| **Session lifetime is the RGS's to enforce; wallet auth is session-to-bet alignment** ([§2 Session lifetime](../readme.md#session-lifetime)) | No handler checks token age. [handler.credit.ts](src/handlers/handler.credit.ts) and `rollback_v1` ([db/sql/002_funcs.sql](src/db/sql/002_funcs.sql)) verify the token against the bet's recorded session (`ERR_IS` on mismatch); sessions are cleaned up only once no active bets remain (this example keeps them forever — see [001_init.sql](src/db/sql/001_init.sql)). |
 | **Balance idempotency keyed by a UUIDv7 you mint** ([§7.2a](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | Balance movements key on `op_key` (the `PRIMARY KEY (op_key, op_ts)` in `src/balance/sql`) - the wallet's own bet-ledger transaction id, minted as a UUIDv7, *not* the RGS id. |
 | **Bet-first ordering: record `pending` → move money → `confirm`** ([§7.2b](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | [handler.debit.ts](src/handlers/handler.debit.ts) (debit), [handler.credit.ts](src/handlers/handler.credit.ts) (settle), [handler.rollback.ts](src/handlers/handler.rollback.ts) (reverse), over the `repo` procs in [db/sql/002_funcs.sql](src/db/sql/002_funcs.sql). |
-| **Delete only a never-funded `pending` bet** ([§7.2b](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | The debit handler deletes the `pending` debit (and empty bet) only on insufficient funds, guarded on the debit still being `pending`. |
-| **Fence a rollback that names an unseen debit (tombstone)** ([§7.2d](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case), [§6.5](../readme.md#65-rollback-reverse-one-or-more-debits)) | The rollback proc records a tombstone; `record_debit` refuses a fenced debit before any money moves. Exercised in [handler.ordering.test.ts](src/handlers/test/handler.ordering.test.ts). |
-| **Double-entry balance with a non-negative guard** ([§5](../readme.md#5-modeling-money-bets-vs-balances-and-why-to-split-them)) | `PostgresBalance` moves between buckets with a negative-balance `CHECK`; `TigerBeetleBalance` uses `debits_must_not_exceed_credits`. |
+| **Delete only a never-funded `pending` bet** ([§7.2b](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | `Repository.settleDebit` deletes the `pending` debit (and empty bet) only on insufficient funds, decided under the debit's row lock in the same transaction as the funding attempt. |
+| **Fence a rollback that names an unseen debit or credit (tombstone)** ([§7.2d](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case), [§6.5](../readme.md#65-rollback-reverse-debits-or-credits-on-an-open-round)) | `rollback_v1` records a tombstone; `record_debit_v1` and `close_bet_v1` refuse a fenced straggler before any money moves. They lock the bet row first, so a straggler and the rollback fencing it serialize; a unique index allows one rollback per ref. Exercised in [handler.ordering.test.ts](src/handlers/test/handler.ordering.test.ts). |
+| **A rollback resolves a `pending` debit** ([§7.2d](../readme.md#72-if-balance-is-a-separate-service-the-realistic-case)) | [handler.rollback.ts](src/handlers/handler.rollback.ts) settles each named `pending` debit through the same `settleDebit` the debit handler uses — funded and confirmed, then reversed; or unaffordable, deleted, then fenced — so the debit's late request and its rollback can't disagree. |
+| **A closed round is final** ([§6.6](../readme.md#66-putting-it-together-multi-debit--multi-credit--rollback-rounds)) | `rollback_v1` refuses any reversal on a closed round (`ERR_BC`), whatever closed it. `close_bet_v1` won't close a round while one of its debits is `pending` (`ERR_UE`, so the credit is re-sent), so that debit's rollback can still reverse it. |
+| **Reversing a credit claws the win back, even into a negative balance** ([§6.5](../readme.md#65-rollback-reverse-debits-or-credits-on-an-open-round)) | [handler.rollback.ts](src/handlers/handler.rollback.ts) moves a reversed credit's win available → enginePayout with `overdraw: true`, the one movement the balance stores let take `available` below zero. This example then refuses every stake until the balance is back above it - one possible operator policy. |
+| **Double-entry balance with an insufficient-funds guard** ([§5](../readme.md#5-modeling-money-bets-vs-balances-and-why-to-split-them)) | `PostgresBalance`'s `_move` refuses any debit of `available` it can't cover, except a clawback (`overdraw`); `TigerBeetleBalance` uses `debits_must_not_exceed_credits`, with clawback debt on the `owed` account. |
 | **Ledger partitioning that never stops growing** ([§7.3](../readme.md#73-scaling-the-ledger-partitioning-a-table-that-never-stops-growing)) | `balance.ledger` is `PARTITION BY RANGE (op_ts)` per ISO week, each week `PARTITION BY HASH (op_key)` × 8, `PK (op_key, op_ts)`; `balance._move` derives `op_ts` from the id; `balance.maintain_ledger_partitions` pre-creates the subtree. `balance.account` is `PARTITION BY HASH (user_id)` × 8. The bet ledger range-partitions by round (`repo.maintain_bet_partitions`). |
 | **Fail-fast on bad migrations** ([§9 pitfalls](../readme.md#9-pitfalls-checklist)) | [main.ts](src/main.ts) migrates before serving and exits non-zero on failure. |
 | **Dev endpoints off by default, gated, never in prod** ([§9 pitfalls](../readme.md#9-pitfalls-checklist)) | [handler.session.ts](src/handlers/handler.session.ts) 404s unless `DEV_ENDPOINTS` is set. |
