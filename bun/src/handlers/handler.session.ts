@@ -22,9 +22,9 @@ export function devSessionRoute(state: State) {
 
     const body = (await req.json().catch(() => ({}))) as {
       currency?: EngineCurrency;
-      // `startingBalance` is what the RGS wallet conformance suite sends;
-      // `balance` is kept as an alias for manual/seed callers. Both are in
-      // minor units (micro-units, 1_000_000 = 1.00).
+      // `balance` is what the RGS wallet conformance suite sends;
+      // `startingBalance` is kept as an alias for older callers. Both are in
+      // micro-units (1_000_000 = 1.00).
       startingBalance?: number;
       balance?: number;
     };
