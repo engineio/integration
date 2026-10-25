@@ -100,7 +100,7 @@ up each test — see the [conformance suite note](../readme.md#the-conformance-s
 ```sh
 curl -s localhost:3000/v1/dev/session \
   -H 'content-type: application/json' \
-  -d '{"currency":"USD","startingBalance":1000000000}'
+  -d '{"currency":"USD","balance":1000000000}'
 # => { "token": "...", "player": ..., "currency": "USD", "balance": 1000000000 }
 ```
 
@@ -113,6 +113,7 @@ printf '%s' "$BODY" > /tmp/body.json
 SIG=$(openssl pkeyutl -sign -inkey private.key -rawin -in /tmp/body.json | base64 -w0)
 curl -s localhost:3000/v1/balance \
   -H 'content-type: application/json' \
+  -H "x-operator: <your-operator-slug>" \
   -H "x-signature: $SIG" \
   -d "$BODY"
 ```
