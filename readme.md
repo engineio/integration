@@ -9,6 +9,12 @@ because it does not depend on language or stack. Each example's own readme then 
 what is specific to it: how to run it, what it's built on, and where in its code each rule
 below lives.
 
+> **The authoritative API reference is on the integration site**,
+> [integration.engine.io](https://integration.engine.io) (open an operator, then its API docs).
+> It is generated for your operator and always matches what Engine runs. This readme explains
+> the contract and the failure model behind it; if the two ever disagree, the integration site
+> wins - and please tell us.
+
 ## What an Engine integration is
 
 Two systems split the work of running a real-money game:
@@ -328,7 +334,7 @@ it - and the `message` is only for your logs. Standard codes:
 
 | Code      | HTTP  | Meaning |
 | --------- | ----- | ------- |
-| `ERR_ATE` | `401` | Failed request authentication — the `x-signature` header is missing or doesn't verify against the RGS public key (or, on a multi-operator wallet, `x-operator` names a slug you don't serve). |
+| `ERR_ATE` | `401` | Failed request authentication — the `x-signature` header is missing or doesn't verify against the RGS public key, or `x-operator` is missing or isn't a slug you serve. |
 | `ERR_IS`  | `400` | Invalid / unknown session token — or, on a credit/rollback, a token that doesn't match the session recorded on the round's bet (§2). |
 | `ERR_IPB` | `400` | Insufficient player balance — the **debit alone** can't be covered (a win must not fund its own stake, §6.4). |
 | `ERR_GLE` | `400` | Player's gambling / loss limit exceeded — distinct from `ERR_IPB`, which is about the balance. The RGS cancels the bet and forwards it to the player. **Debit only**; use it for your own responsible-gambling rejections. |
@@ -348,14 +354,13 @@ any failure with `401` `ERR_ATE`:
 
 | Header        | Required | Description |
 | ------------- | -------- | ----------- |
-| `x-operator`  | yes      | Your operator slug, on every wallet call. A wallet serving several operators routes on it and rejects a slug it doesn't serve with `401` `ERR_ATE`; a single-operator wallet can ignore it. |
 | `x-signature` | yes      | Base64 **Ed25519** signature over the **raw request body bytes** (RFC 8032, no pre-hash), signed with the RGS's private key. Standard base64 **with padding** (not URL-safe) — a 64-byte signature, 88 base64 characters. Verify against the RGS Ed25519 public key (PEM, `BEGIN PUBLIC KEY`) from the integration site (API Reference → Engine public key). |
+| `x-operator`  | yes      | Your operator slug (shown on the integration site). Reject with `401` `ERR_ATE` if it is missing or isn't a slug you serve. If you run several integrations on one wallet, use it to pick that integration's config, and key sessions, rounds and idempotency records by it. |
 | `Content-Type`| yes      | `application/json; charset=utf-8` in production; the conformance suite sends a bare `application/json` — accept both. |
 
 (`x-operator` is not authentication, and the signature doesn't cover it: one Engine key signs
 every operator's calls, so the signature proves the caller is the RGS, not which operator the
-call is for. Cross-check it against the operator the signed `token` resolves to. Your calls to
-Engine carry `X-Operator` + `X-Signature` the same way, below.)
+call is for. Cross-check it against the operator the signed `token` resolves to.)
 
 - Verify against the **exact bytes** you received, then parse *those same bytes* as JSON. Do
   not re-serialize the parsed object and verify against that - key ordering and whitespace
@@ -366,106 +371,123 @@ Engine carry `X-Operator` + `X-Signature` the same way, below.)
 
 ### The other direction: calls you make to Engine
 
-The wallet endpoints above are Engine calling **you**. There is also a `/v1` API **you
-call**, at base URL `https://operator.engine.io` — keep it in configuration rather than as a
-constant. The auth direction reverses: sign each request body with **your** Ed25519 private
-key (same scheme — base64 Ed25519 over the raw body) and send `X-Operator` + `X-Signature` on
-every call, plus `Content-Type: application/json` on POSTs; Engine verifies with the public key
-you uploaded on the integration site. For GETs, sign the empty body (zero bytes). Generate the
-keypair with `openssl genpkey -algorithm ed25519` and upload the public key as PEM
-(`openssl pkey -pubout`, a `BEGIN PUBLIC KEY` block). Up to 10 keys can be registered at once
-and any of them verifies, so rotation is add-new → deploy → delete-old; Engine caches an
-integration's key set for up to 15 minutes, so register a key before pointing traffic at it.
-Integrations created before the key migration may still sign with legacy RSA keys — the
-ingress verifies both — but register Ed25519 keys.
+The wallet endpoints above are Engine calling **you**. The operator API is the set of endpoints
+**you call**, at base URL `https://operator.engine.io`, all under `/v1` — keep the base URL in
+configuration rather than as a constant. The auth direction reverses: sign each request body
+with **your** private key (same scheme — base64 Ed25519 over the raw body) and send these
+headers:
 
-Errors on this direction carry **no JSON envelope** — route on the status code alone: `401`
-signature or slug problem, `400` broken JSON, a bad query parameter or an empty required
-string, `404` unknown or unapproved game / unknown product, `415` a POST without
-`Content-Type: application/json`, `422` a body that parses but breaks the schema (missing
-field, unknown currency, value outside an enum), `424` demo play disabled platform-wide (demo
-route only), `5xx` retry.
+| Header         | Description |
+| -------------- | ----------- |
+| `X-Operator`   | Your operator slug. Tells Engine which public key verifies the signature. |
+| `X-Signature`  | Base64 signature over the exact request body. For GETs, sign the empty body (zero bytes). |
+| `Content-Type` | `application/json`, on POSTs. |
 
-Games are addressed by **product + publisher + game slugs**, not a single id: a *product* is a
-wire contract on Engine (from `GET /v1/product`), a *publisher* is the studio behind the game,
-and the two ride with the game slug on every launch call.
+Engine verifies with the public key you uploaded on the integration site. Generate the keypair
+with `openssl genpkey -algorithm ed25519` and upload the public key as PEM (`openssl pkey
+-pubout`, a `BEGIN PUBLIC KEY` block). Up to 10 keys can be registered at once and any of them
+verifies, so rotation is add-new → deploy → delete-old; Engine caches an integration's key set
+for up to 15 minutes, so register a key before pointing traffic at it. Integrations created
+before the key migration may still sign with legacy RSA keys — the ingress accepts both during
+rotation — but new keys should be Ed25519.
 
-#### `GET /v1/product` — the products available to you
+Errors on this API are **plain-text status lines, not JSON** — branch on the status code: `401`
+a missing or failing signature or an unknown slug, `400` broken JSON, a bad query parameter or
+an empty required string, `404` an unknown or unapproved game or an unknown product, `415` a
+POST without `Content-Type: application/json`, `422` a body that parses but breaks the schema
+(a missing field, an unknown currency, a value outside an enum), `424` demo play disabled
+platform-wide (demo route only), `5xx` retry.
 
-No request body (still sign the empty body). Response is a top-level array; use the `product`
-id in the product-scoped fields and routes below:
+**Games are addressed by three slugs**, sent as separate fields: `product` (the platform that
+serves the game), `publisher` (the studio that built it) and `game`. Take all three from the game
+list verbatim; never build or split them yourself, since slugs can contain underscores and
+hyphens.
 
-```json
-[ { "product": "studio", "name": "Studio" } ]
-```
+#### `GET /v1/product` — list your products
+
+The products your operator may launch from. Response is a top-level JSON array:
+
+| Field        | Type   | Description |
+| ------------ | ------ | ----------- |
+| `[].product` | string | Product slug — the `{product}` path segment and `product` field everywhere else. |
+| `[].name`    | string | Display name. |
+
+#### `GET /v1/{product}/game` — list enabled games
+
+The games approved for your operator on one product. No request body — still sign the empty
+body.
+
+| Query   | Type  | Required | Description |
+| ------- | ----- | -------- | ----------- |
+| `after` | int64 | no       | Incremental sync cursor (unix ms): pass the `updated` value from your last response to get only what changed since. Omit for the whole catalogue. |
+
+Response:
+
+| Field               | Type            | Required | Description |
+| ------------------- | --------------- | -------- | ----------- |
+| `updated`           | int64 (unix ms) | yes      | Newest update across the whole catalogue, computed before `after` filtering — the cursor to send as `after` next time. |
+| `games[].product`   | string          | yes      | Product slug. |
+| `games[].publisher` | string          | yes      | Publisher slug. |
+| `games[].game`      | string          | yes      | Game slug. |
+| `games[].name`      | string          | yes      | Display name for your lobby. |
+| `games[].rtp`       | float64         | yes      | Target return-to-player as a fraction — ×100 for the percentage. Passed through from the game's math with no ceiling. |
+| `games[].updated`   | int64 (unix ms) | yes      | When this game was last published — the clock `after` filters on. |
+| `games[].image`     | string (URL)    | no       | Cover art. **Omitted** (not null) when none published. |
+
+The `after` boundary is inclusive, so dedupe by (`product`, `publisher`, `game`). Incremental
+sync never reports removals, and a game newly enabled for you keeps its original publish time,
+so refresh the full list periodically as well.
 
 #### `POST /v1/game/url` — start a real-money session
 
 Call when a logged-in player clicks Play. The `token` you supply here is what comes back to
-your wallet as the `token` field on every subsequent `/v1/*` wallet call — this is where
-sessions are born. Store it server-side keyed to the player.
+your wallet as the `token` field on every subsequent wallet call — this is where sessions are
+born. Store it server-side keyed to the player.
 
 | Field       | Type              | Required | Description |
 | ----------- | ----------------- | -------- | ----------- |
-| `product`   | string            | yes      | From `GET /v1/product`. `404` if unknown or not enabled for you. |
+| `product`   | string            | yes      | Product slug, from the game list. |
 | `publisher` | string            | yes      | Publisher slug, from the game list. |
-| `game`      | string            | yes      | Game slug, from the game list — addressed *with* its publisher. |
+| `game`      | string            | yes      | Game slug, from the game list. |
 | `user`      | string            | yes      | Your operator-side user id. Treated as opaque; never shown to the player. |
-| `token`     | string            | yes      | Your one-time session token. Opaque to Engine, but the call is **not idempotent**: every call mints a new session, so mint a fresh token per launch and don't re-POST after a timeout expecting the same session back. |
+| `token`     | string            | yes      | Your session token, unique per session. Opaque to Engine. Handed back on every wallet call for this session. |
 | `currency`  | string            | yes      | Uppercase code from Engine's currency list (§2); there is no per-operator list. |
 | `language`  | string (BCP-47)   | no       | Game UI language, e.g. `en`, `pt-br`. Defaults `en`. |
-| `device`    | string            | no       | `desktop` (default), `mobile`, or `tablet`. |
-| `tag`       | string (enum)     | no       | Player classification: `real` (default), `affiliate`, `streamer`, `employee`, `qa`. Use `real` for paying customers; the rest are excluded from production accounting. |
+| `device`    | string            | no       | `desktop` (default), `mobile` or `tablet`. |
+| `tag`       | string            | no       | Player classification: `real` (default), `affiliate`, `streamer`, `employee`, `qa`. Use `real` for paying customers; the rest are excluded from production accounting. |
 
-Response: `{ "url": …, "fair": … }` — a launch `url` (string) to redirect the player to, and
-`fair` (bool), whether this session's rounds are provably fair (`true` only when the game
-supports it *and* fair draws are enabled on your operator). The URL is **opaque**: its host
-belongs to the game's front end, not a fixed Engine domain — redirect or iframe it verbatim,
-never rebuild, allowlist or parse it, and don't log it (it carries the player's Engine
-session). `404` covers both an unknown (publisher, game) pair and a game with no approved,
-active version for your operator — Engine does not distinguish them.
+Response: `{ "url": …, "fair": … }` — a launch `url` to redirect the player to, and `fair`
+(bool), whether this session's rounds are provably fair (`true` only when the game supports it
+*and* fair draws are enabled on your operator). The URL is **opaque**: its host belongs to the
+game's front end, not a fixed Engine domain — redirect or iframe it verbatim, never rebuild,
+allowlist or parse it, and don't log it (it carries the player's Engine session). `404` covers
+both an unknown game and one with no approved, active version for your operator. Not
+idempotent: every call starts a new session, so mint a fresh token per launch and don't
+re-POST after a timeout expecting the same session back.
 
 #### `POST /v1/game/url/demo` — start a demo session
 
-Same addressing, pinned to demo balances (try-before-signup, QA). Demo sessions never touch
-your wallet — they settle against Engine's internal demo wallet, so no `/v1`
-debit/credit/rollback traffic reaches your ingress for demo play.
+A play-money session, for showing a game before there is a player (try-before-signup, QA). Demo
+play settles against Engine's own demo wallet, so **no wallet calls reach you**.
 
 | Field       | Type              | Required | Description |
 | ----------- | ----------------- | -------- | ----------- |
 | `product`   | string            | yes      | As above. |
 | `publisher` | string            | yes      | As above. |
 | `game`      | string            | yes      | As above. |
-| `currency`  | string            | no       | Demo-balance currency. Defaults `USD` (`XGC` on sweepstake deployments — a deployment-wide property that does not follow your jurisdiction, so send it explicitly if you care which you get). |
-| `token`     | string (uuid)     | no       | Session token — must be a UUID here (unlike `/v1/game/url`, where it's opaque); omit it and Engine mints one. It also stands in for the user id, which is why there is no `user` field. |
-| `device`    | string            | no       | `desktop` (default), `mobile`, `tablet`. |
+| `currency`  | string            | no       | Defaults `USD` (`XGC` on sweepstakes deployments — a deployment-wide property that doesn't follow your jurisdiction, so send it explicitly if you care which you get). |
+| `token`     | string (UUID)     | no       | Session token — must be a UUID here (unlike `/v1/game/url`); generated if omitted. It also stands in for the user id, which is why there is no `user` field. |
+| `device`    | string            | no       | `desktop` (default), `mobile` or `tablet`. |
 | `language`  | string (BCP-47)   | no       | Defaults `en`. |
-| `balance`   | uint64            | no       | Starting demo balance in micro-units; omit for the default. |
+| `balance`   | uint64            | no       | Starting demo balance in micro-units. |
 
-Response: `{ "url": … }` only — no `fair`.
+Response: `{ "url": … }`.
 
-#### `GET /v1/{product}/game` — enabled games
+#### Other endpoints
 
-The games approved for your operator, per product — e.g. `GET /v1/studio/game`. No request
-body (sign the empty body). Cache it and sync incrementally: pass `?after=<unix ms>` echoing
-the top-level `updated` you last saw (the boundary instant is re-delivered, so dedup by
-publisher + game). `?after=` never delivers a removal, and a game newly enabled for you keeps
-its original update time, so also re-fetch the full list (no `after`) periodically and
-reconcile. Response is an **object envelope**:
-
-| Field               | Type            | Required | Description |
-| ------------------- | --------------- | -------- | ----------- |
-| `updated`           | int64 (unix ms) | yes      | Newest update across the whole catalog, computed before `?after=` filtering — feed back as `?after=` on the next sync. |
-| `games[].product`   | string          | yes      | The product this game runs on. |
-| `games[].publisher` | string          | yes      | Publisher (studio) slug — pair with `game` on `POST /v1/game/url`. |
-| `games[].game`      | string          | yes      | Game slug. |
-| `games[].name`      | string          | yes      | Display name for your lobby. |
-| `games[].image`     | string (URL)    | no       | Cover art. Key **absent** (not null) when none published. |
-| `games[].updated`   | int64 (unix ms) | yes      | When this game last changed — the clock `?after=` filters on. |
-| `games[].rtp`       | float64         | yes      | Target return-to-player as a fraction — ×100 for the percentage. Passed through from the game's math with no ceiling. |
-
-The full reference for this direction — including `GET /v1/bet/{id}` (bet lookup) and the
-provably-fair `/v1/fair/*` endpoints — lives on the integration site's API page.
+The operator API also has `GET /v1/bet/{id}` (one settled round) and the provably-fair
+endpoints under `/v1/fair/{product}/{publisher}/{game}` (mode table, per-player seed pair and
+rotation, outcome verification). See the integration site for their shapes.
 
 ## 3. Status codes are your safety mechanism
 
@@ -1245,9 +1267,11 @@ rollback of a `pending` debit (item 8) and a clawback into a negative balance (i
 test those yourself.
 
 To run it you implement one extra, **dev-only** endpoint the suite uses to set up each test:
-`POST <your ingress URL>/v1/dev/session` (the portal derives that path; you can't move it). The
-suite signs it like a wallet call and sends `{ "currency", "balance" }`, with `balance` in
-micro-units (possibly `0`). Fund a test player with exactly that balance and answer `200` with
-`{ "token": "…" }`, a fresh session (see the bun example's `/v1/dev/session`). Keep it off by
-default and gated behind an explicit flag — it mints sessions and resets balances, so it must
-never be reachable in production (see the pitfalls checklist, §9).
+`POST <your ingress URL>/v1/dev/session` (the portal derives that path from your ingress URL;
+you can't move it). The suite sends `{ "currency": "USD", "balance": 1000000 }`, with
+`balance` in micro-units (possibly `0`); fund a test player with exactly that balance and
+answer `200` with `{ "token": "…" }`, a fresh session (see the bun example's
+`/v1/dev/session`). It signs the request like a wallet call (`x-operator` + `x-signature`), so
+you can verify it the same way. Keep it off by default and gated behind an explicit flag — it
+mints sessions and resets balances, so it must never be reachable in production (see the
+pitfalls checklist, §9).

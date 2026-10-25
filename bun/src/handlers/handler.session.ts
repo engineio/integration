@@ -21,11 +21,13 @@ export function devSessionRoute(state: State) {
 
     const body = (await req.json().catch(() => ({}))) as {
       currency?: EngineCurrency;
-      // What the conformance suite sends, in micro-units (1_000_000 = 1.00). It may be 0.
+      // `balance` is what the conformance suite sends (it may be 0); `startingBalance` is kept as
+      // an alias for older callers. Both are micro-units (1_000_000 = 1.00).
+      startingBalance?: number;
       balance?: number;
     };
     const currency: EngineCurrency = body.currency ?? "USD";
-    const amount = body.balance ?? 1_000_000_000;
+    const amount = body.balance ?? body.startingBalance ?? 1_000_000_000;
 
     const game = await state.repo.ensureDevGame();
     await state.balance.reset(DEV_USER, currency, amount);

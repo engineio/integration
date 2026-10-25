@@ -115,6 +115,7 @@ printf '%s' "$BODY" > /tmp/body.json
 SIG=$(openssl pkeyutl -sign -inkey private.key -rawin -in /tmp/body.json | base64 -w0)
 curl -s localhost:3000/v1/balance \
   -H 'content-type: application/json' \
+  -H "x-operator: <your-operator-slug>" \
   -H "x-signature: $SIG" \
   -d "$BODY"
 ```
@@ -246,7 +247,7 @@ the *where*.
 
 | Contract rule | Where it lives here |
 | ------------- | ------------------- |
-| **Signature check before parsing** ([§2 Authentication](../readme.md#authentication)) | [routes.ts](src/handlers/routes.ts) verifies `x-signature` over the raw body bytes as the first step, before `JSON.parse`. This example serves a single operator, so it ignores `x-operator`. |
+| **Signature check before parsing** ([§2 Authentication](../readme.md#authentication)) | [routes.ts](src/handlers/routes.ts) verifies `x-signature` over the raw body bytes as the first step, before `JSON.parse`. It doesn't check `x-operator` yet; a production wallet must reject a missing or unknown slug with `ERR_ATE` (§2). |
 | **Error codes → HTTP status; unknown failures are `ERR_UE`** ([§2](../readme.md#error-response-contract), [§3](../readme.md#3-status-codes-are-your-safety-mechanism)) | [handlers/errors.ts](src/handlers/errors.ts) - `WalletError` codes and `toErrorResponse()`. |
 | **Request validation lenient, response validation strict** (hardening practice: unknown inbound fields are ignored for forward-compat; own responses are strictly checked) | AJV schemas per handler; response validation hard-fails only outside production ([routes.ts](src/handlers/routes.ts)). |
 | **Idempotency enforced by DB constraints** ([§4](../readme.md#4-idempotency-no-duplicate-bets-no-duplicate-transactions)) | [db/sql/001_init.sql](src/db/sql/001_init.sql): round is the bet's `PRIMARY KEY` (one operator, so round alone is unique), transaction ids are `UNIQUE`. The `*_v1` procs return the canonical stored ids on replay. |
