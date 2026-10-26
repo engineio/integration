@@ -1,8 +1,8 @@
 import type { FromSchema } from "json-schema-to-ts";
-import { ErrNotClosable, ErrNotFound } from "../db/errors";
+import { ErrFenced, ErrNotClosable, ErrNotFound } from "../db/errors";
 import { ErrBadRequest, ErrBetComplete, ErrBetNotFound, ErrInvalidSession } from "./errors";
 import type { Handler, State } from "./routes";
-import { BalanceResponseSchema, EngineCurrencySchema, UuidSchema } from "./schema";
+import { BalanceResponseSchema, EngineCurrencySchema, TokenSchema, UuidSchema } from "./schema";
 
 export const schema = {
   request: {
@@ -10,7 +10,7 @@ export const schema = {
     required: ["token", "round", "active", "ip"],
     additionalProperties: true,
     properties: {
-      token: UuidSchema,
+      token: TokenSchema,
       round: { type: "number" },
       active: { type: "boolean" },
       ip: { type: "string" },
@@ -52,10 +52,11 @@ type CreditRequest = FromSchema<typeof schema.request>;
  * `active = false` finally closes it. A missing `credit` is a losing/zero settlement — with
  * `active = false` it closes the round paying nothing.
  *
- * Bet-first ordering: the bet ledger owns "can a credit land here", records the credit (validating
- * its `ref`, a FK to the settled debit), and only then does the win move enginePayout -> available
- * on the balance service, keyed by the credit's id. Replaying a credit returns the stored result;
- * each win is paid at most once across retries. A new credit on an already-closed round is refused.
+ * Bet-first ordering: the bet ledger owns "can a credit land here", records the credit, and only
+ * then does the win move enginePayout -> available on the balance service, keyed by the credit's
+ * id. Replaying a credit returns the stored result; each win is paid at most once across retries.
+ * A new credit on an already-closed round is refused, and so is a straggler whose id a rollback
+ * fenced before it arrived.
  *
  * Session validation is against the STORED BET: the token must match the session recorded on
  * the round's bet (ERR_IS otherwise); the session table is never consulted.
@@ -89,6 +90,7 @@ export const creditHandler: Handler<State, CreditRequest> = async ({ body, state
     active: body.active,
   }).catch((err) => {
     if (err instanceof ErrNotClosable) throw new ErrBetComplete("round already closed");
+    if (err instanceof ErrFenced) throw new ErrBadRequest("credit was rolled back before it arrived");
     throw err;
   });
 

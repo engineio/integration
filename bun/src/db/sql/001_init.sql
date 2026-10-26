@@ -9,16 +9,17 @@ CREATE TYPE repo.transaction_type AS ENUM ('debit', 'rollback', 'credit');
 --             Deleted entirely if that first/only debit can't be afforded.
 --   open    — at least one debit has confirmed; live and settleable. Further debits may be ADDED
 --             (each with its own transaction id) while the bet is open.
---   closed  — settled by a credit, or closed by an active=false debit/rollback. Terminal:
---             nothing happens to a closed bet.
--- (There is no 'voided'. A rollback that arrives before its debit is fenced per-DEBIT by a
---  tombstone rollback transaction — see repo.transaction_status and rollback_debits_v1 in 002.)
+--   closed  — settled by a credit, or closed by an active=false debit/rollback. Final: nothing
+--             that moves money lands on a closed bet; replays still return their stored result.
+-- (There is no 'voided'. A rollback that arrives before the debit or credit it names fences it
+--  per-transaction with a tombstone rollback transaction — see rollback_v1 in 002.)
 CREATE TYPE repo.bet_status AS ENUM ('pending', 'open', 'closed');
 
 -- A debit's stake can be mid-flight (it is recorded before the money moves), and a bet may already
 -- be 'open' from earlier debits — so the in-flight state lives on the transaction, not the bet.
 --   pending   — a debit recorded, stake not yet confirmed. Deleted if it can't be afforded.
---   confirmed — stake taken. Credits and rollbacks are always written 'confirmed' (no reject path).
+--   confirmed — stake taken. A single-shot's concurrent credit is pending with its debit (and
+--               confirmed or deleted with it); other credits and rollbacks are written 'confirmed'.
 CREATE TYPE repo.transaction_status AS ENUM ('pending', 'confirmed');
 
 CREATE TYPE repo.currency AS ENUM (
@@ -63,13 +64,13 @@ CREATE INDEX idx_session_user ON repo.session ("user", created_at DESC);
 -- live in the same range partition (co-located). Why RANGE on the round, not on time:
 -- every hot lookup is by round (getBet / close / rollback / get_bet_v1), so the round is
 -- the only key that both prunes those lookups AND gives time-correlated retention. Round
--- ids are monotonically increasing; when they are also dense (the RGS controls id
--- allocation, so it can guarantee no gaps) a fixed id-width range holds a predictable
--- ~width rows — i.e. the partition WIDTH is the target row capacity, and maintenance stays
--- a trivial fixed-width loop. (Sparse ids stay correct — gaps just leave ranges lighter —
--- only less uniformly sized.) Detaching the low-id ranges drops the oldest rounds.
+-- ids count up per operator and are near-dense (a failed open can skip one), so the range
+-- WIDTH is the partition's row capacity and maintenance stays a trivial fixed-width loop.
+-- Detaching the low-id ranges drops the oldest rounds.
 -- Partitions are managed by repo.maintain_bet_partitions (002_funcs.sql); a DEFAULT
--- partition catches ids beyond the pre-created ranges (keep it empty in steady state).
+-- partition catches ids beyond the pre-created ranges, e.g. the conformance suite's random
+-- rounds (up to 2^32) on staging. A row parked there blocks creating the range that covers
+-- it, so keep DEFAULT empty wherever partitions are maintained.
 --
 -- Partitioning forces the partition key into every unique key, so repo.transaction's PK is
 -- (id, bet_id) and its RGS-id uniqueness is (ext_id, bet_id). Both id and ext_id are
@@ -98,22 +99,25 @@ CREATE TABLE repo.transaction (
     id         uuid NOT NULL, -- the wallet's own transaction id (returned to the RGS, and used as
                               -- the balance service's idempotency key — see the handlers)
     type       repo.transaction_type NOT NULL,
-    status     repo.transaction_status NOT NULL DEFAULT 'confirmed', -- pending only for in-flight debits
+    status     repo.transaction_status NOT NULL DEFAULT 'confirmed', -- pending: in-flight debit (+ its single-shot credit)
     bet_id     int8 NOT NULL, -- the round; RANGE partition key (co-located with repo.bet)
     ext_id     uuid NOT NULL, -- the RGS transaction id; UNIQUE per round, so each debit is its own
                               -- idempotency unit — a NEW ext_id on an open bet ADDS a debit, a
                               -- replayed ext_id returns the stored transaction.
-    reference  uuid,          -- the debit a credit/rollback settles (enforced in the procs)
+    reference  uuid,          -- the debit a credit settles, or the debit/credit a rollback reverses
+    concurrent boolean NOT NULL DEFAULT false, -- a single-shot's win, carried on its debit
     amount     int8 NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (id, bet_id),
     UNIQUE (ext_id, bet_id)
 ) PARTITION BY RANGE (bet_id);
 CREATE INDEX idx_transaction_bet ON repo.transaction (bet_id);
-CREATE INDEX idx_transaction_reference ON repo.transaction (reference) WHERE type = 'rollback';
+-- One rollback per ref (debit or credit): a second rollback id for the same ref moves nothing.
+CREATE UNIQUE INDEX idx_transaction_rollback_ref ON repo.transaction (bet_id, reference) WHERE type = 'rollback';
 CREATE TABLE repo.transaction_default PARTITION OF repo.transaction DEFAULT;
 
--- A debit opens a bet (no reference); credits and rollbacks always settle a debit.
+-- A debit opens a bet (no reference); credits reference the debit they settle, rollbacks the
+-- debit or credit they reverse.
 ALTER TABLE repo.transaction
     ADD CONSTRAINT transaction_reference_check CHECK (
         (type = 'debit' AND reference IS NULL) OR

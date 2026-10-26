@@ -5,24 +5,26 @@
 -- enums here, so callers don't need them).
 --
 -- Custom SQLSTATE (mapped to ErrInsufficientBalance in balance/postgres.ts):
---   SEIPB  insufficient player balance (`available` would go negative)
+--   SEIPB  insufficient player balance (`available` can't cover a non-overdraw debit)
 
 -- Apply one double-entry movement, keyed by `p_op_key` for idempotency. The ledger row is
 -- claimed first: if the key already exists this movement was already applied (a replay),
 -- so we skip the account changes entirely and return. Otherwise we take the amount out of
--- the source bucket and put it into the destination. `available` is guarded against going
--- negative — that guard IS the insufficient-funds check (the available_non_negative CHECK
--- backs it up); the counter-accounts may go negative.
+-- the source bucket and put it into the destination.
 --
--- The source is a direct UPDATE (never an upsert): an upsert would propose a negative
--- candidate row that trips the CHECK before ON CONFLICT can merge it. Internal helper.
+-- A debit of `available` must be covered: that guard IS the insufficient-funds check, with
+-- no CHECK behind it. It is a conditional UPDATE, so the comparison and the decrement are one
+-- step under the row lock. `p_overdraw` skips it: a clawback lands whatever the player has
+-- left and may take `available` negative, and while it is negative every guarded debit
+-- fails. The counter-accounts are unguarded and may go negative. Internal helper.
 CREATE OR REPLACE FUNCTION balance._move(
     p_user     int4,
     p_currency balance.currency,
     p_debit    balance.bucket,
     p_credit   balance.bucket,
     p_amount   int8,
-    p_op_key   uuid
+    p_op_key   uuid,
+    p_overdraw boolean
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -44,7 +46,7 @@ BEGIN
         RETURN; -- replay: this movement already happened, don't apply it again
     END IF;
 
-    IF p_debit = 'available' THEN
+    IF p_debit = 'available' AND NOT p_overdraw THEN
         UPDATE balance.account SET amount = amount - p_amount
         WHERE user_id = p_user AND currency = p_currency AND type = 'available' AND amount >= p_amount;
         IF NOT FOUND THEN
@@ -63,21 +65,23 @@ END;
 $$;
 
 -- Apply 1-2 movements for one player atomically (one statement) and return the new
--- `available` balance. Each movement carries its own op key. Movements that DEBIT
--- `available` are applied first (regardless of argument order), so a same-batch win can
--- never fund the stake (e.g. $5 balance, $10 stake, $20 win is rejected, not netted to
--- +$10). A full replay finds every op key already present and applies nothing.
+-- `available` balance. Each movement carries its own op key and overdraw flag. Movements
+-- that DEBIT `available` are applied first (regardless of argument order), so a same-batch
+-- win can never fund the stake (e.g. $5 balance, $10 stake, $20 win is rejected, not netted
+-- to +$10). A full replay finds every op key already present and applies nothing.
 CREATE OR REPLACE FUNCTION balance.transfer_v1(
-    p_user     int4,
-    p_currency varchar,
-    m1_debit   varchar,
-    m1_credit  varchar,
-    m1_amount  int8,
-    m1_op_key  uuid,
-    m2_debit   varchar DEFAULT NULL,
-    m2_credit  varchar DEFAULT NULL,
-    m2_amount  int8    DEFAULT NULL,
-    m2_op_key  uuid    DEFAULT NULL
+    p_user      int4,
+    p_currency  varchar,
+    m1_debit    varchar,
+    m1_credit   varchar,
+    m1_amount   int8,
+    m1_op_key   uuid,
+    m1_overdraw boolean,
+    m2_debit    varchar DEFAULT NULL,
+    m2_credit   varchar DEFAULT NULL,
+    m2_amount   int8    DEFAULT NULL,
+    m2_op_key   uuid    DEFAULT NULL,
+    m2_overdraw boolean DEFAULT false
 )
 RETURNS int8
 LANGUAGE plpgsql
@@ -88,16 +92,16 @@ DECLARE
 BEGIN
     -- Pass 1: available-debits. Pass 2: everything else.
     IF m1_debit = 'available' THEN
-        PERFORM balance._move(p_user, v_cur, m1_debit::balance.bucket, m1_credit::balance.bucket, m1_amount, m1_op_key);
+        PERFORM balance._move(p_user, v_cur, m1_debit::balance.bucket, m1_credit::balance.bucket, m1_amount, m1_op_key, m1_overdraw);
     END IF;
     IF m2_debit = 'available' THEN
-        PERFORM balance._move(p_user, v_cur, m2_debit::balance.bucket, m2_credit::balance.bucket, m2_amount, m2_op_key);
+        PERFORM balance._move(p_user, v_cur, m2_debit::balance.bucket, m2_credit::balance.bucket, m2_amount, m2_op_key, m2_overdraw);
     END IF;
     IF m1_debit <> 'available' THEN
-        PERFORM balance._move(p_user, v_cur, m1_debit::balance.bucket, m1_credit::balance.bucket, m1_amount, m1_op_key);
+        PERFORM balance._move(p_user, v_cur, m1_debit::balance.bucket, m1_credit::balance.bucket, m1_amount, m1_op_key, m1_overdraw);
     END IF;
     IF m2_debit IS NOT NULL AND m2_debit <> 'available' THEN
-        PERFORM balance._move(p_user, v_cur, m2_debit::balance.bucket, m2_credit::balance.bucket, m2_amount, m2_op_key);
+        PERFORM balance._move(p_user, v_cur, m2_debit::balance.bucket, m2_credit::balance.bucket, m2_amount, m2_op_key, m2_overdraw);
     END IF;
 
     SELECT amount INTO v_avail FROM balance.account

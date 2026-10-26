@@ -52,6 +52,20 @@ describe("debit", () => {
     expect(body.code).toBe("ERR_IPB");
   });
 
+  walletTest("an unaffordable single-shot leaves no trace: its win is deleted with its stake", async ({ call, session, sql }) => {
+    const s = await session(5_000_000);
+    const round = 7;
+    const debitId = uuid();
+    const { body } = await call("/v1/debit", signed({
+      token: s.token, round, active: false, mode: "base", ip: "1.1.1.1",
+      debit: { id: debitId, amount: 10_000_000, currency: "USD" },
+      credit: { id: uuid(), amount: 20_000_000, ref: debitId, currency: "USD" },
+    }));
+    expect(body.code).toBe("ERR_IPB");
+    expect(await sql`SELECT 1 FROM repo.transaction WHERE bet_id = ${round}`).toHaveLength(0);
+    expect(await sql`SELECT 1 FROM repo.bet WHERE id = ${round}`).toHaveLength(0);
+  });
+
   walletTest("single-shot debit rejects when the stake alone exceeds balance, even if the win nets positive", async ({ call, session }) => {
     const s = await session(5_000_000); // $5
     const { status, body } = await call(

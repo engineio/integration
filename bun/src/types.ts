@@ -33,9 +33,19 @@ export interface Session {
  *  debits plus 0..N credits. */
 export type BetStatus = "pending" | "open" | "closed";
 
-/** A debit transaction's lifecycle (see repo.transaction_status). Credits/rollbacks are always
- *  `confirmed`; only an in-flight debit is `pending`. */
+/** A debit transaction's lifecycle (see repo.transaction_status). Only an in-flight debit (and a
+ *  single-shot's concurrent credit, with it) is `pending`; other credits/rollbacks are `confirmed`. */
 export type TransactionStatus = "pending" | "confirmed";
+
+/** A `pending` debit as Repository.settleDebit hands it to the funding step: its own ids (the
+ *  balance op keys), the stake, and the win a single-shot carries. */
+export interface PendingDebit {
+  id: string;
+  amount: number;
+  user: number;
+  currency: EngineCurrency;
+  credit?: { id: string; amount: number };
+}
 
 export interface Bet {
   /** The RGS "round" number — also the bet's primary key. */

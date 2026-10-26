@@ -63,9 +63,16 @@ describe("request validation", () => {
   });
 
   walletTest("ERR_BAD when an id field isn't a UUID (format: uuid)", async ({ call }) => {
-    const { status, body } = await call("/v1/balance", signed({ token: "not-a-uuid" }));
+    const rollbacks = [{ id: "not-a-uuid", ref: "not-a-uuid" }];
+    const { status, body } = await call("/v1/rollback", signed({ token: uuid(), round: 1, rollbacks }));
     expect(status).toBe(400);
     expect(body.code).toBe("ERR_BAD");
+  });
+
+  walletTest("ERR_IS for a token we never issued, whatever its shape", async ({ call }) => {
+    const { status, body } = await call("/v1/balance", signed({ token: "not-a-uuid" }));
+    expect(status).toBe(400);
+    expect(body.code).toBe("ERR_IS");
   });
 
   walletTest("ERR_BAD on a (validly signed) non-JSON body", async ({ base }) => {

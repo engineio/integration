@@ -5,14 +5,14 @@
  * is human-readable for logs. These codes are part of the integration spec.
  */
 export type ErrorCode =
-  | "ERR_BAD" // bad request (malformed input, or a debit fenced by a prior rollback)
+  | "ERR_BAD" // bad request (malformed input, or a debit or credit fenced by a prior rollback)
   | "ERR_IPB" // insufficient player balance
   | "ERR_IS" // invalid session token
   | "ERR_ATE" // failed request authentication (bad/missing signature)
   | "ERR_BNF" // bet not found
   | "ERR_BC" // bet already complete — the round is closed/settled
-  | "ERR_GE" // general error
-  | "ERR_UE"; // general error during rollback
+  | "ERR_GE" // definitively failed, no money moved — on a debit the RGS cancels the bet, no rollback
+  | "ERR_UE"; // outcome uncertain, money may have moved — on a debit the RGS reverses it with a rollback
 
 export abstract class WalletError extends Error {
   declare cause: unknown;
@@ -57,7 +57,7 @@ export class ErrBetNotFound extends WalletError {
   }
 }
 
-/** The round is closed/settled — a new debit/credit/rollback can't land on it. */
+/** The round is closed — a new debit, credit or reversal can't land on it. */
 export class ErrBetComplete extends WalletError {
   constructor(msg = "bet already complete", cause?: unknown) {
     super(400, "ERR_BC", msg, cause);
@@ -70,21 +70,22 @@ export class ErrInsufficientPlayerBalance extends WalletError {
   }
 }
 
-export class ErrGeneralError extends WalletError {
+/** The safe default for any failure you can't classify — see ERR_UE above. */
+export class ErrUnknownError extends WalletError {
   constructor(cause?: unknown) {
-    super(500, "ERR_GE", "Internal Server Error", cause);
+    super(500, "ERR_UE", "Unknown Error", cause);
   }
 }
 
 
 /**
  * Map any thrown value to a wallet error Response. Known WalletErrors keep their code;
- * anything else is logged and becomes a generic ERR_GE so internals never leak.
+ * anything else is logged and becomes ERR_UE so internals never leak.
  */
 export function toErrorResponse(err: unknown): Response {
   if (err instanceof WalletError) {
     return err.toResponse();
   }
 
-  return new ErrGeneralError(err).toResponse();
+  return new ErrUnknownError(err).toResponse();
 }

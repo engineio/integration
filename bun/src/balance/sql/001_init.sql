@@ -22,9 +22,11 @@ CREATE TYPE balance.currency AS ENUM (
 -- `testFunds` is the dev/test source that deposits are drawn from.
 CREATE TYPE balance.bucket AS ENUM ('available', 'engineBet', 'enginePayout', 'testFunds');
 
--- One row per (player, currency, bucket). `available` may never go negative — that
--- CHECK is the insufficient-funds guard (a debit that overdraws it fails the
--- constraint). The counter-accounts (engineBet/enginePayout/testFunds) are unconstrained.
+-- One row per (player, currency, bucket). There is no non-negative CHECK on `available`: a
+-- clawback (an overdraw movement) must land even when it takes the player below zero. The
+-- insufficient-funds guard lives in balance._move instead, which refuses every other debit
+-- `available` can't cover. The counter-accounts (engineBet/enginePayout/testFunds) are
+-- unconstrained.
 --
 -- HASH-partitioned by user_id into 8 partitions. The account row is read AND upserted on
 -- every bet, so it's the hottest table; hashing on user_id keeps each partition's PK
@@ -41,8 +43,7 @@ CREATE TABLE balance.account (
     currency balance.currency NOT NULL,
     type     balance.bucket   NOT NULL,
     amount   int8             NOT NULL DEFAULT 0,
-    PRIMARY KEY (user_id, currency, type),
-    CONSTRAINT available_non_negative CHECK (type <> 'available' OR amount >= 0)
+    PRIMARY KEY (user_id, currency, type)
 ) PARTITION BY HASH (user_id);
 
 CREATE TABLE balance.account_0 PARTITION OF balance.account FOR VALUES WITH (MODULUS 8, REMAINDER 0);

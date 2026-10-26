@@ -32,8 +32,7 @@ export class ErrForeignKeyViolation extends ErrDatabase {
   }
 }
 
-/** Bet exists but a new transaction can't land on it — it's already closed (a new credit/rollback
- *  arrived after the round was closed). */
+/** A new credit or a reversal on a closed round. */
 export class ErrNotClosable extends ErrDatabase {
   constructor(message: string, cause?: unknown) {
     super(message, cause);
@@ -57,16 +56,15 @@ export class ErrInsufficientBalance extends ErrDatabase {
   }
 }
 
-/** A debit arrived for an ext_id a rollback already fenced (rollback-before-debit). Terminal. */
-export class ErrDebitFenced extends ErrDatabase {
-  constructor(message = "debit fenced", cause?: unknown) {
+/** A debit or credit arrived for an ext_id a rollback already fenced (rollback-before-it). Terminal. */
+export class ErrFenced extends ErrDatabase {
+  constructor(message = "fenced", cause?: unknown) {
     super(message, cause);
-    this.name = "ErrDebitFenced";
+    this.name = "ErrFenced";
   }
 }
 
-/** A debit arrived for a round that is already closed (a credit/rollback on a closed round is
- *  ErrNotClosable). Terminal — nothing after closed. */
+/** A new debit arrived for a round that is already closed. */
 export class ErrRoundClosed extends ErrDatabase {
   constructor(message = "round closed", cause?: unknown) {
     super(message, cause);
@@ -103,13 +101,13 @@ export function intoRepoError(error: unknown): never {
       throw new ErrConcurrent("bet locked", error);
     case "SEBNF": // stored proc: bet not found
       throw new ErrNotFound("bet not found", error);
-    case "SEBNC": // stored proc: round already closed (a new credit/rollback can't land on it)
+    case "SEBNC": // stored proc: new credit or reversal on a closed round
       throw new ErrNotClosable("round already closed", error);
     case "SEIPB": // stored proc: insufficient player balance
       throw new ErrInsufficientBalance("insufficient balance", error);
-    case "SEFEN": // stored proc: this debit was fenced by a prior rollback (rollback-before-debit)
-      throw new ErrDebitFenced("debit fenced", error);
-    case "SECLO": // stored proc: round closed (nothing after closed)
+    case "SEFEN": // stored proc: this debit or credit was fenced by a prior rollback
+      throw new ErrFenced("fenced", error);
+    case "SECLO": // stored proc: new debit on a closed round
       throw new ErrRoundClosed("round closed", error);
     case "SESMM": // stored proc: session doesn't match the bet's recorded session
       throw new ErrSessionMismatch("session mismatch", error);

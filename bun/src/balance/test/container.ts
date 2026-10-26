@@ -1,10 +1,13 @@
+import { PostgreSqlContainer } from "@testcontainers/postgresql";
+import { SQL } from "bun";
 import { GenericContainer, Wait } from "testcontainers";
 import { type Client, createClient } from "tigerbeetle-node";
+import { PostgresBalance } from "../postgres";
 
 // One TigerBeetle for the whole test run: started lazily on first use, shared by every test
-// (the standalone TigerBeetleBalance tests and the parametrized handler suite), and reaped by
-// testcontainers (Ryuk) on exit. A single shared client too — TigerBeetle caps concurrent
-// clients per cluster, and a client-per-test under `test.concurrent` would blow past it.
+// (the balance tests and the parametrized handler suite), and reaped by testcontainers (Ryuk)
+// on exit. A single shared client too — TigerBeetle caps concurrent clients per cluster, and a
+// client-per-test under `test.concurrent` would blow past it.
 //
 // The image tag MUST match the tigerbeetle-node client version (client and cluster are
 // released in lockstep). Notes on the flags:
@@ -45,4 +48,19 @@ async function start(): Promise<Client> {
     cluster_id: 0n,
     replica_addresses: [`${ip}:${container.getMappedPort(PORT)}`],
   });
+}
+
+let postgresP: Promise<PostgresBalance> | undefined;
+
+// One migrated PostgresBalance for the balance tests, on its own Postgres. Like the TigerBeetle
+// cluster it is shared, and tests stay apart by using distinct user ids.
+export function sharedPostgresBalance(): Promise<PostgresBalance> {
+  return (postgresP ??= startPostgres());
+}
+
+async function startPostgres(): Promise<PostgresBalance> {
+  const container = await new PostgreSqlContainer("postgres:18-alpine").start();
+  const balance = new PostgresBalance(new SQL({ url: container.getConnectionUri(), max: 4 }));
+  await balance.migrate();
+  return balance;
 }

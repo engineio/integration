@@ -1,9 +1,10 @@
 import type { FromSchema } from "json-schema-to-ts";
-import { type Transfer, ErrInsufficientBalance } from "../balance";
-import { ErrDebitFenced, ErrNotFound, ErrRoundClosed } from "../db/errors";
+import { type Balance, type Transfer, ErrInsufficientBalance } from "../balance";
+import { ErrFenced, ErrNotFound, ErrRoundClosed } from "../db/errors";
 import { ErrBadRequest, ErrBetComplete, ErrInsufficientPlayerBalance, ErrInvalidSession } from "./errors";
+import type { PendingDebit } from "../types";
 import type { Handler, State } from "./routes";
-import { BalanceResponseSchema, EngineCurrencySchema, UuidSchema } from "./schema";
+import { BalanceResponseSchema, EngineCurrencySchema, TokenSchema, UuidSchema } from "./schema";
 
 export const schema = {
   request: {
@@ -12,7 +13,7 @@ export const schema = {
     // Lenient on unknown inbound fields for forward-compat with the RGS (see balance handler).
     additionalProperties: true,
     properties: {
-      token: UuidSchema,
+      token: TokenSchema,
       round: { type: "number" },
       active: { type: "boolean" },
       mode: { type: "string" },
@@ -71,12 +72,13 @@ type DebitRequest = FromSchema<typeof schema.request>;
  *
  * Bet-first ordering: the debit is recorded BEFORE any money moves, so the ledger can fence it —
  * a rollback that referenced this debit's ext_id before it arrived makes record_debit_v1 refuse it
- * (ErrDebitFenced), and a debit on a closed round is refused (ErrRoundClosed), both before the
+ * (ErrFenced), and a debit on a closed round is refused (ErrRoundClosed), both before the
  * stake is touched. The transaction ids are the balance op keys (wallet-minted UUIDv7s), so the
  * balance owns its v7 invariant with no translation table. record/transfer/confirm are each
  * idempotent, so an RGS replay converges. If the stake can't be afforded the pending debit is
- * deleted (no money moved); any other uncertain outcome returns a retryable error so the RGS
- * re-drives. We never return success while the outcome is uncertain.
+ * deleted (no money moved); any other uncertain outcome returns ERR_UE, and the RGS either re-sends
+ * the debit or rolls it back — that rollback settles a still-pending debit the same way. We never
+ * return success while the outcome is uncertain.
  */
 export const debitHandler: Handler<State, DebitRequest> = async ({ body, state }) => {
   const { repo, balance } = state;
@@ -106,34 +108,41 @@ export const debitHandler: Handler<State, DebitRequest> = async ({ body, state }
     debit: { amount: body.debit.amount, extId: body.debit.id },
     credit: body.credit ? { amount: body.credit.amount, extId: body.credit.id } : undefined,
   }).catch((err) => {
-    if (err instanceof ErrDebitFenced) throw new ErrBadRequest("debit was rolled back before it arrived");
+    if (err instanceof ErrFenced) throw new ErrBadRequest("debit was rolled back before it arrived");
     if (err instanceof ErrRoundClosed) throw new ErrBetComplete("round is closed");
     throw err;
   });
 
-  // 2. Move money, keyed by this debit's own transaction ids. Stake moves available -> engineBet; a
-  //    concurrent win moves enginePayout -> available. transfer applies the available-debit
-  //    (stake) first, so the win can't fund the stake. If the stake can't be afforded, the
-  //    pending debit is deleted — nothing moved (and the bet too, if this was its first debit).
-  const stake: Transfer = { userId: session.user, currency: session.currency, amount: body.debit.amount, credit: "engineBet", debit: "available", opKey: debit.id };
-  const movements: [Transfer] | [Transfer, Transfer] = credit
-    ? [stake, { userId: session.user, currency: session.currency, amount: credit.amount, credit: "available", debit: "enginePayout", opKey: credit.id }]
-    : [stake];
-  const newBalance = await balance.transfer(movements).catch(async err => {
-    if (err instanceof ErrInsufficientBalance) {
-      await repo.rejectDebit(body.round, body.debit.id);
-      throw new ErrInsufficientPlayerBalance(err);
-    }
-    throw err;
-  });
-
-
-  // 3. Funds confirmed → this debit becomes confirmed; the round opens (or closes for active=false).
-  await repo.confirmDebit(body.round, body.debit.id, body.active);
+  // 2. Settle it: move the money, then confirm the debit (the round opens, or closes for
+  //    active=false) — or, if the stake can't be afforded, delete it: nothing moved (and the bet
+  //    goes too, if this was its first debit). A rollback naming this debit settles it the same
+  //    way under the same row lock, so if one got there first we just report what it decided.
+  const settled = await repo.settleDebit(
+    { round: body.round, debitExtId: body.debit.id, active: body.active },
+    (d) => fundDebit(balance, d),
+  );
+  if (settled.status === "rejected") throw new ErrInsufficientPlayerBalance();
 
   return Response.json({
     debit_id: debit.id,
     credit_id: credit?.id,
-    balance: { amount: newBalance, currency: session.currency },
+    balance: { amount: settled.balance ?? (await balance.get(session.user, session.currency)), currency: session.currency },
   });
 };
+
+/**
+ * Fund a pending debit, keyed by its own transaction ids so whoever settles it moves the money
+ * once: the stake moves available -> engineBet and a single-shot's win enginePayout -> available.
+ * transfer applies the stake first, so the win can't fund it. Returns the new balance, or null if
+ * the stake can't be afforded (nothing moved).
+ */
+export function fundDebit(balance: Balance, d: PendingDebit): Promise<number | null> {
+  const stake: Transfer = { userId: d.user, currency: d.currency, amount: d.amount, credit: "engineBet", debit: "available", opKey: d.id };
+  const movements: [Transfer] | [Transfer, Transfer] = d.credit
+    ? [stake, { userId: d.user, currency: d.currency, amount: d.credit.amount, credit: "available", debit: "enginePayout", opKey: d.credit.id }]
+    : [stake];
+  return balance.transfer(movements).catch((err) => {
+    if (err instanceof ErrInsufficientBalance) return null;
+    throw err;
+  });
+}

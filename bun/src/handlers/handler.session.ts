@@ -8,11 +8,10 @@ import type { State } from "./routes";
 const DEV_USER = 1;
 
 /**
- * Dev-only route: reset the shared test player to a known balance and hand back a
- * fresh session token. NOT signature-authenticated (it isn't wrapped by the router) —
- * gated behind `state.devEndpoints` (DEV_ENDPOINTS). When disabled it 404s and does
- * nothing, so it is inert in production. In a real integration the operator mints
- * sessions from its own game-launch flow.
+ * Dev-only route: reset the shared test player to a known balance and hand back a fresh
+ * session token. The suite signs it, but this example doesn't verify it (it isn't wrapped
+ * by the router); it 404s unless DEV_ENDPOINTS is set. In a real integration the operator
+ * mints sessions from its own game-launch flow.
  */
 export function devSessionRoute(state: State) {
   return async (req: Bun.BunRequest): Promise<Response> => {
@@ -22,14 +21,13 @@ export function devSessionRoute(state: State) {
 
     const body = (await req.json().catch(() => ({}))) as {
       currency?: EngineCurrency;
-      // `balance` is what the RGS wallet conformance suite sends;
-      // `startingBalance` is kept as an alias for older callers. Both are in
-      // micro-units (1_000_000 = 1.00).
+      // `balance` is what the conformance suite sends (it may be 0); `startingBalance` is kept as
+      // an alias for older callers. Both are micro-units (1_000_000 = 1.00).
       startingBalance?: number;
       balance?: number;
     };
     const currency: EngineCurrency = body.currency ?? "USD";
-    const amount = body.startingBalance ?? body.balance ?? 1_000_000_000;
+    const amount = body.balance ?? body.startingBalance ?? 1_000_000_000;
 
     const game = await state.repo.ensureDevGame();
     await state.balance.reset(DEV_USER, currency, amount);

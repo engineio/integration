@@ -32,12 +32,16 @@ async function main() {
   // the handlers don't care which is wired in. The bet ledger (repo) is always Postgres.
   let balance: Balance;
   let tbClient: Client | undefined;
+  let balanceDb: SQL | undefined;
   if (env.balanceBackend === "tigerbeetle") {
     tbClient = createClient({ cluster_id: BigInt(env.tbClusterId), replica_addresses: [env.tbAddress] });
     balance = new TigerBeetleBalance(tbClient);
   } else {
-    // Postgres needs its schema migrated before serving; TigerBeetle has none.
-    const pg = new PostgresBalance(db);
+    // Postgres needs its schema migrated before serving; TigerBeetle has none. Its own pool, as a
+    // separate service would have: settling a debit holds a bet-ledger connection while it funds
+    // the stake, so sharing one pool could exhaust it with every connection waiting on another.
+    balanceDb = new SQL({ url: env.databaseUrl, max: env.dbPoolMax });
+    const pg = new PostgresBalance(balanceDb);
     await pg.migrate();
     balance = pg;
   }
@@ -67,6 +71,7 @@ async function main() {
   // cleanup before exit
   await server.stop();
   await db.end();
+  await balanceDb?.end();
   tbClient?.destroy();
   process.exit(0);
 }

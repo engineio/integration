@@ -133,4 +133,171 @@ describe("rollback", () => {
     expect(after.status).toBe(400);
     expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(100_000_000);
   });
+
+  // --- a closed round is final, whatever closed it -----------------------------------------
+
+  walletTest("refuses to reverse a debit that closed its own round (active:false)", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 40;
+    const debitId = uuid();
+    // An instant loss: the debit takes the stake and closes the round in one call.
+    expect((await call("/v1/debit", debit(s.token, round, debitId, 10_000_000, false))).body.balance.amount).toBe(90_000_000);
+
+    // The RGS couldn't confirm that debit and rolls it back; the round is closed, so ERR_BC — which
+    // the RGS takes to mean the debit landed and the bet is a completed loss.
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: debitId }] }));
+    expect(rb.status).toBe(400);
+    expect(rb.body.code).toBe("ERR_BC");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(90_000_000);
+  });
+
+  walletTest("refuses a rollback after a losing close (a credit with no payout)", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 41;
+    const debitId = uuid();
+    await call("/v1/debit", debit(s.token, round, debitId, 10_000_000));
+    const close = await call("/v1/credit", signed({ token: s.token, round, active: false, ip: "1.1.1.1" }));
+    expect(close.status).toBe(200);
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref: debitId }] }));
+    expect(rb.status).toBe(400);
+    expect(rb.body.code).toBe("ERR_BC");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(90_000_000);
+  });
+
+  walletTest("refuses a rollback of a single-shot whose win closed the round", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 42;
+    const debitId = uuid();
+    const shot = await call("/v1/debit", signed({
+      token: s.token, round, active: false, mode: "base", ip: "1.1.1.1",
+      debit: { id: debitId, amount: 10_000_000, currency: "USD" },
+      credit: { id: uuid(), amount: 30_000_000, ref: debitId, currency: "USD" },
+    }));
+    expect(shot.body.balance.amount).toBe(120_000_000);
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref: debitId }] }));
+    expect(rb.body.code).toBe("ERR_BC");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(120_000_000);
+  });
+
+  walletTest("refuses to reverse a debit left on a round a rollback closed", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 43;
+    const d1 = uuid(), d2 = uuid();
+    await call("/v1/debit", debit(s.token, round, d1, 10_000_000));
+    await call("/v1/debit", debit(s.token, round, d2, 20_000_000));
+    // Reverse d1 and close the round; d2's stake stands for good.
+    await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: d1 }] }));
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: d2 }] }));
+    expect(rb.body.code).toBe("ERR_BC");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(80_000_000);
+  });
+
+  // --- reversing credits -------------------------------------------------------------------
+
+  const credit = (token: string, round: number, id: string, ref: string, amount: number, active: boolean) =>
+    signed({ token, round, active, ip: "1.1.1.1", credit: { id, amount, ref, currency: "USD" } });
+
+  walletTest("claws back a staged credit on an open round, once", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 50;
+    const d1 = uuid(), c1 = uuid();
+    await call("/v1/debit", debit(s.token, round, d1, 10_000_000));
+    expect((await call("/v1/credit", credit(s.token, round, c1, d1, 5_000_000, true))).body.balance.amount).toBe(95_000_000);
+
+    const rbReq = signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref: c1 }] });
+    const rb = await call("/v1/rollback", rbReq);
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(90_000_000);
+    const replay = await call("/v1/rollback", rbReq);
+    expect(replay.body.rollback_ids).toEqual(rb.body.rollback_ids);
+    expect(replay.body.balance.amount).toBe(90_000_000);
+
+    // The round is still open: a corrected win closes it.
+    expect((await call("/v1/credit", credit(s.token, round, uuid(), d1, 3_000_000, false))).body.balance.amount).toBe(93_000_000);
+  });
+
+  walletTest("reverses a debit and a credit together in one batch", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 51;
+    const d1 = uuid(), d2 = uuid(), c1 = uuid();
+    await call("/v1/debit", debit(s.token, round, d1, 10_000_000));
+    await call("/v1/debit", debit(s.token, round, d2, 20_000_000));
+    await call("/v1/credit", credit(s.token, round, c1, d1, 5_000_000, true));
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(75_000_000);
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: d2 }, { id: uuid(), ref: c1 }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.rollback_ids).toHaveLength(2);
+    expect(rb.body.balance.amount).toBe(90_000_000); // d2 refunded, c1 clawed back; d1's stake stands
+  });
+
+  walletTest("reversing an open single-shot's debit claws back the win it carried", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 57;
+    const debitId = uuid();
+    const shot = await call("/v1/debit", signed({
+      token: s.token, round, active: true, mode: "base", ip: "1.1.1.1",
+      debit: { id: debitId, amount: 10_000_000, currency: "USD" },
+      credit: { id: uuid(), amount: 30_000_000, ref: debitId, currency: "USD" },
+    }));
+    expect(shot.body.balance.amount).toBe(120_000_000);
+
+    const rbReq = signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: debitId }] });
+    const rb = await call("/v1/rollback", rbReq);
+    expect(rb.status).toBe(200);
+    expect(rb.body.rollback_ids).toHaveLength(1);
+    expect(rb.body.balance.amount).toBe(100_000_000);
+    const replay = await call("/v1/rollback", rbReq);
+    expect(replay.body.rollback_ids).toEqual(rb.body.rollback_ids);
+    expect(replay.body.balance.amount).toBe(100_000_000);
+  });
+
+  walletTest("a clawback the player can't cover takes the balance negative, and blocks stakes", async ({ call, session }) => {
+    const s = await session(10_000_000);
+    const round = 52;
+    const d1 = uuid(), c1 = uuid();
+    await call("/v1/debit", debit(s.token, round, d1, 10_000_000));
+    await call("/v1/credit", credit(s.token, round, c1, d1, 30_000_000, true));
+    // The player spends most of the win on another round.
+    await call("/v1/debit", debit(s.token, 53, uuid(), 25_000_000));
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(5_000_000);
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref: c1 }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(-25_000_000);
+
+    const stake = await call("/v1/debit", debit(s.token, 54, uuid(), 1_000_000));
+    expect(stake.body.code).toBe("ERR_IPB");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(-25_000_000);
+  });
+
+  walletTest("refuses to reverse a credit after the round closed", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 55;
+    const d1 = uuid(), c1 = uuid();
+    await call("/v1/debit", debit(s.token, round, d1, 10_000_000));
+    await call("/v1/credit", credit(s.token, round, c1, d1, 20_000_000, false));
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: c1 }] }));
+    expect(rb.body.code).toBe("ERR_BC");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(110_000_000);
+  });
+
+  walletTest("a rollback naming an unseen credit fences it; the straggler credit is refused", async ({ call, session }) => {
+    const s = await session(100_000_000);
+    const round = 56;
+    const d1 = uuid(), unseen = uuid();
+    await call("/v1/debit", debit(s.token, round, d1, 10_000_000));
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref: unseen }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(90_000_000);
+
+    const straggler = await call("/v1/credit", credit(s.token, round, unseen, d1, 5_000_000, false));
+    expect(straggler.body.code).toBe("ERR_BAD");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(90_000_000);
+  });
 });

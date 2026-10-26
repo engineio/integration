@@ -1,4 +1,4 @@
-import { randomUUIDv7 as uuid } from "bun";
+import { randomUUIDv7 as uuid, type SQL } from "bun";
 import { describe, expect } from "bun:test";
 import { walletTest } from "./harness";
 import { signed } from "./helpers";
@@ -203,32 +203,227 @@ describe("out-of-order & idempotency", () => {
     expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(before); // untouched
   });
 
-  // --- a rollback racing an in-flight (pending) debit ------------------------------------
+  // --- a rollback naming a debit left `pending` (its request died mid-flight) -------------
+  //
+  // The RGS rolls a debit back once it has stopped re-sending it, so nothing else will ever settle
+  // a debit left `pending` — the rollback must. These stage that state directly: the bet and debit
+  // recorded `pending` (record_debit_v1's writes), the handler then gone before confirming.
 
-  walletTest("a rollback while the referenced debit is still pending is retryable (not terminal)", async ({ call, session, sql }) => {
-    const s = await session(100_000_000);
-    const round = 8;
-    const debitRef = uuid();
-
-    // Simulate a debit that recorded the bet (`pending`) + a `pending` debit transaction but crashed
-    // before confirming its stake — the exact in-flight window. (record_debit_v1 writes the bet
-    // pending + the debit txn pending, then the handler moves money and confirms; here we stop after
-    // the record.)
+  const crashedDebit = async (sql: SQL, s: { token: string; user: number }, round: number, ext: string, amount: number) => {
+    const id = uuid();
     const [sess] = await sql`SELECT game FROM repo.session WHERE id = ${s.token}::uuid`;
     await sql`INSERT INTO repo.bet (id, session, "user", game, currency, status)
-              VALUES (${round}, ${s.token}::uuid, ${s.user}, ${Number(sess.game)}, 'USD'::repo.currency, 'pending'::repo.bet_status)`;
+              VALUES (${round}, ${s.token}::uuid, ${s.user}, ${Number(sess.game)}, 'USD'::repo.currency, 'pending'::repo.bet_status)
+              ON CONFLICT (id) DO NOTHING`;
     await sql`INSERT INTO repo.transaction (id, bet_id, type, status, amount, ext_id)
-              VALUES (${uuid()}::uuid, ${round}, 'debit', 'pending'::repo.transaction_status, 10000000, ${debitRef}::uuid)`;
+              VALUES (${id}::uuid, ${round}, 'debit', 'pending'::repo.transaction_status, ${amount}, ${ext}::uuid)`;
+    return id;
+  };
 
-    // A rollback can't reverse a not-yet-funded debit, but it may still resolve — so it's a
-    // retryable 5xx, not a terminal 4xx. The RGS re-drives until the debit confirms (then reverse)
-    // or is rejected (then nothing to reverse).
-    const res = await call("/v1/rollback", signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref: debitRef }] }));
-    expect(res.status).toBe(500);
+  // Hold a transaction open (e.g. a row lock) until the test releases it.
+  const hold = (sql: SQL, work: (tx: SQL) => Promise<unknown>) => {
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let ready!: () => void;
+    const held = new Promise<void>((r) => (ready = r));
+    const done = sql.begin(async (tx) => {
+      await work(tx);
+      ready();
+      await released;
+    });
+    return { held, release: async () => { release(); await done; } };
+  };
 
-    // The bet is left untouched (still pending) — the rollback did not settle or void it.
-    const [b] = await sql`SELECT status FROM repo.bet WHERE id = ${round}`;
-    expect(b.status).toBe("pending");
+  walletTest("a rollback settles a debit left pending before its stake moved, then refunds it", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 8;
+    const ref = uuid();
+    await crashedDebit(sql, s, round, ref, 10_000_000);
+
+    const rbReq = signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref }] });
+    const rb = await call("/v1/rollback", rbReq);
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(100_000_000); // stake taken by the re-drive, then refunded
+    const [d] = await sql`SELECT status FROM repo.transaction WHERE bet_id = ${round} AND type = 'debit'`;
+    expect(d.status).toBe("confirmed");
+    expect((await call("/v1/rollback", rbReq)).body.rollback_ids).toEqual(rb.body.rollback_ids);
+
+    // The debit's own late retry finds it settled: no re-charge.
+    const late = await call("/v1/debit", debit(s.token, round, ref, 10_000_000));
+    expect(late.status).toBe(200);
+    expect(late.body.balance.amount).toBe(100_000_000);
+  });
+
+  walletTest("a rollback settles a debit left pending after its stake moved, then refunds it", async ({ call, session, sql, balance }) => {
+    const s = await session(100_000_000);
+    const round = 11;
+    const ref = uuid();
+    const id = await crashedDebit(sql, s, round, ref, 10_000_000);
+    // The stake moved (keyed by the debit's own id) before the crash.
+    await balance.transfer([{ userId: s.user, currency: "USD", amount: 10_000_000, credit: "engineBet", debit: "available", opKey: id }]);
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(90_000_000);
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(100_000_000); // the re-drive moved nothing more; the stake came back once
+  });
+
+  walletTest("a rollback deletes and fences a pending debit it can't afford", async ({ call, session, sql }) => {
+    const s = await session(5_000_000);
+    const round = 12;
+    const ref = uuid();
+    await crashedDebit(sql, s, round, ref, 10_000_000);
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(5_000_000); // nothing moved
+    expect(await sql`SELECT 1 FROM repo.transaction WHERE bet_id = ${round} AND type = 'debit'`).toHaveLength(0);
+
+    // The debit's late retry is now a straggler: fenced, and takes no stake.
+    const late = await call("/v1/debit", debit(s.token, round, ref, 10_000_000));
+    expect(late.body.code).toBe("ERR_BAD");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(5_000_000);
+  });
+
+  walletTest("a rollback waits for the debit's row lock rather than settling around it", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 14;
+    const ref = uuid();
+    await crashedDebit(sql, s, round, ref, 10_000_000);
+    // Someone else (the debit's own late request) is settling it.
+    const lock = hold(sql, (tx) => tx`SELECT 1 FROM repo.transaction WHERE bet_id = ${round} AND ext_id = ${ref}::uuid FOR UPDATE`);
+    await lock.held;
+
+    const rbReq = signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref }] });
+    try {
+      const blocked = await call("/v1/rollback", rbReq);
+      expect(blocked.body.code).toBe("ERR_UE"); // lock_timeout: retry, nothing moved
+      expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(100_000_000);
+      const [d] = await sql`SELECT status FROM repo.transaction WHERE bet_id = ${round} AND type = 'debit'`;
+      expect(d.status).toBe("pending");
+    } finally {
+      await lock.release();
+    }
+    const rb = await call("/v1/rollback", rbReq);
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(100_000_000);
+  });
+
+  walletTest("a rollback from another session moves nothing on a pending debit", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const other = await session(100_000_000);
+    const round = 15;
+    const ref = uuid();
+    await crashedDebit(sql, s, round, ref, 10_000_000);
+
+    const rb = await call("/v1/rollback", signed({ token: other.token, round, rollbacks: [{ id: uuid(), ref }] }));
+    expect(rb.body.code).toBe("ERR_IS");
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(100_000_000);
+    const [d] = await sql`SELECT status FROM repo.transaction WHERE bet_id = ${round} AND type = 'debit'`;
+    expect(d.status).toBe("pending");
+  });
+
+  walletTest("a closing credit waits while a debit is pending, so its rollback can still refund it", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 16;
+    const d0 = uuid(), d1 = uuid();
+    await call("/v1/debit", debit(s.token, round, d0, 10_000_000));
+    await crashedDebit(sql, s, round, d1, 10_000_000);
+
+    const closeReq = signed({ token: s.token, round, active: false, ip: "1.1.1.1", credit: { id: uuid(), amount: 0, ref: d0, currency: "USD" } });
+    expect((await call("/v1/credit", closeReq)).body.code).toBe("ERR_UE");
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref: d1 }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(90_000_000); // only d0's stake stands
+
+    expect((await call("/v1/credit", closeReq)).status).toBe(200); // the re-sent credit lands
+  });
+
+  walletTest("a closing rollback or debit waits while another debit is pending", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 19;
+    const d0 = uuid(), d1 = uuid(), d2 = uuid();
+    await call("/v1/debit", debit(s.token, round, d0, 10_000_000));
+    await crashedDebit(sql, s, round, d1, 10_000_000);
+
+    // Closing the round now would leave d1's rollback unable to reverse it.
+    const closeByRollback = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: d0 }] }));
+    expect(closeByRollback.body.code).toBe("ERR_UE");
+    const closeByDebit = await call("/v1/debit", debit(s.token, round, d2, 5_000_000, undefined, false));
+    expect(closeByDebit.body.code).toBe("ERR_UE");
+
+    // The RGS rolls back the debits it couldn't confirm; nothing was lost along the way.
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: d1 }, { id: uuid(), ref: d2 }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.balance.amount).toBe(90_000_000); // only d0's stake stands
+  });
+
+  walletTest("a rollback of a pending single-shot settles it and reverses its win too", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 20;
+    const ref = uuid();
+    await crashedDebit(sql, s, round, ref, 10_000_000);
+    await sql`INSERT INTO repo.transaction (id, bet_id, type, status, concurrent, amount, ext_id, reference)
+              VALUES (${uuid()}::uuid, ${round}, 'credit', 'pending'::repo.transaction_status, true, 30000000, ${uuid()}::uuid, ${ref}::uuid)`;
+
+    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref }] }));
+    expect(rb.status).toBe(200);
+    expect(rb.body.rollback_ids).toHaveLength(1);
+    expect(rb.body.balance.amount).toBe(100_000_000); // stake and win both moved, both reversed
+  });
+
+  walletTest("a straggler debit racing the rollback that fences it can't keep a stake", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 17;
+    await call("/v1/debit", debit(s.token, round, uuid(), 10_000_000)); // the round is open
+    const ref = uuid();
+    const [sess] = await sql`SELECT game FROM repo.session WHERE id = ${s.token}::uuid`;
+
+    // The straggler has recorded its debit but not committed when the rollback arrives.
+    const straggler = hold(sql, (tx) => tx`SELECT * FROM repo.record_debit_v1(
+      ${round}, ${s.token}::uuid, ${s.user}, ${Number(sess.game)}, 'USD', 10000000, ${uuid()}::uuid, ${ref}::uuid, NULL, NULL, NULL)`);
+    await straggler.held;
+    const rbReq = signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref }] });
+    const rb = call("/v1/rollback", rbReq);
+    await Bun.sleep(200);
+    await straggler.release();
+    await rb;
+
+    // The straggler's request carries on; the RGS re-sends the rollback until it gets a 2xx.
+    await call("/v1/debit", debit(s.token, round, ref, 10_000_000));
+    expect((await call("/v1/rollback", rbReq)).status).toBe(200);
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(90_000_000);
+  });
+
+  walletTest("two rollbacks with different ids for one debit, racing, refund it once", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 18;
+    const ref = uuid();
+    await call("/v1/debit", debit(s.token, round, ref, 10_000_000));
+
+    await Promise.all([
+      call("/v1/rollback", signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref }] })),
+      call("/v1/rollback", signed({ token: s.token, round, active: true, rollbacks: [{ id: uuid(), ref }] })),
+    ]);
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(100_000_000);
+    expect(await sql`SELECT 1 FROM repo.transaction WHERE bet_id = ${round} AND type = 'rollback'`).toHaveLength(1);
+  });
+
+  walletTest("a pending debit's late retry and its rollback, racing, settle it once", async ({ call, session, sql }) => {
+    const s = await session(100_000_000);
+    const round = 13;
+    const ref = uuid();
+    await crashedDebit(sql, s, round, ref, 10_000_000);
+
+    const [late, rb] = await Promise.all([
+      call("/v1/debit", debit(s.token, round, ref, 10_000_000)),
+      call("/v1/rollback", signed({ token: s.token, round, rollbacks: [{ id: uuid(), ref }] })),
+    ]);
+    expect(late.status).toBe(200);
+    expect(rb.status).toBe(200);
+    // Whichever settled it, the stake moved once and came back once.
+    expect((await call("/v1/balance", signed({ token: s.token }))).body.balance.amount).toBe(100_000_000);
   });
 
   // --- plain replays of credit and rollback ----------------------------------------------

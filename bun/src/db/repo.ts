@@ -2,8 +2,8 @@ import type { SQL } from "bun";
 import type { EngineCurrency } from "../handlers/schema";
 import { migrate } from "../database";
 import { load } from "../migrate.macro" with { type: "macro" };
-import type { Bet, Credit, Debit, Game, Provider, Session } from "../types";
-import { ErrNotFound, intoRepoError } from "./errors";
+import type { Bet, Credit, Debit, Game, PendingDebit, Provider, Session } from "../types";
+import { ErrNotFound, ErrSessionMismatch, intoRepoError } from "./errors";
 
 // Bundled at build time (see migrate.macro.ts) so the binary is self-contained.
 const migrations = load("./db/sql");
@@ -93,7 +93,7 @@ export class Repository {
    *  a later debit (a NEW ext_id) is APPENDED while the round is open. Atomic and committed on
    *  return. IDEMPOTENT on the debit's ext_id — record_debit_v1 returns the originally stored ids
    *  on a replay (the freshly minted ones below are used only on first record). Throws
-   *  ErrDebitFenced if a rollback already cancelled this debit (rollback-before-debit) and
+   *  ErrFenced if a rollback already cancelled this debit (rollback-before-debit) and
    *  ErrRoundClosed if the round is already closed — both terminal 4xx in the handler. The returned
    *  debit / credit ids are wallet-minted UUIDv7s; the handler uses them directly as balance op keys. */
   async recordDebit(params: {
@@ -150,18 +150,49 @@ export class Repository {
     return [bet, debit, credit];
   }
 
-  /** Confirm a debit once its stake has moved: the debit goes `pending` → `confirmed`, promoting
-   *  the bet `pending` → `open` on the first confirm (active=true) or `closed` (active=false closes
-   *  the round). Idempotent — a re-drive after confirmation is a no-op. */
-  async confirmDebit(round: number, debitExtId: string, active: boolean): Promise<void> {
-    await this.sql`SELECT repo.confirm_debit_v1(${round}, ${debitExtId}::uuid, ${active})`.catch(intoRepoError);
-  }
+  /** Settle a `pending` debit. Under the debit's row lock, `fund` moves its money (idempotent on
+   *  the debit's own ids) and returns the new balance, or null if the stake can't be afforded; the
+   *  debit is then confirmed (closing the round for `active = false`) or rejected — deleted, since
+   *  nothing moved — in the same transaction. The debit's own request and a rollback naming it both
+   *  settle through here, so whichever takes the lock first decides and the other finds it settled:
+   *  the balance and the bet ledger can't disagree. `balance` is set only when this call funded it.
+   *  "rejected" also covers a debit that no longer exists. With `session`, a debit whose bet belongs
+   *  to another session throws ErrSessionMismatch before anything moves. */
+  async settleDebit(
+    params: { round: number; debitExtId: string; active: boolean; session?: string },
+    fund: (debit: PendingDebit) => Promise<number | null>,
+  ): Promise<{ status: "confirmed" | "rejected"; balance?: number }> {
+    const { round, debitExtId, active, session } = params;
+    return this.sql.begin(async (tx) => {
+      await tx`SET LOCAL lock_timeout = '1s'`;
+      const [d] = await tx`
+        SELECT d.id, d.amount, d.status, b.session, b."user", b.currency
+        FROM repo.transaction d JOIN repo.bet b ON b.id = d.bet_id
+        WHERE d.bet_id = ${round} AND d.type = 'debit' AND d.ext_id = ${debitExtId}::uuid
+        FOR UPDATE OF d
+      `;
+      if (!d) return { status: "rejected" as const };
+      if (d.status !== "pending") return { status: "confirmed" as const };
+      if (session !== undefined && d.session !== session) throw new ErrSessionMismatch();
 
-  /** Reject a debit whose stake couldn't be afforded: deletes that pending debit (and the bet too,
-   *  if it was the only transaction — the clean rejection of an unaffordable first debit). Safe —
-   *  no money moved. */
-  async rejectDebit(round: number, debitExtId: string): Promise<void> {
-    await this.sql`SELECT repo.reject_debit_v1(${round}, ${debitExtId}::uuid)`.catch(intoRepoError);
+      const [c] = await tx`
+        SELECT id, amount FROM repo.transaction
+        WHERE bet_id = ${round} AND type = 'credit' AND reference = ${debitExtId}::uuid AND status = 'pending'
+      `;
+      const balance = await fund({
+        id: d.id as string,
+        amount: Number(d.amount),
+        user: Number(d.user),
+        currency: d.currency as EngineCurrency,
+        credit: c ? { id: c.id as string, amount: Number(c.amount) } : undefined,
+      });
+      if (balance === null) {
+        await tx`SELECT repo.reject_debit_v1(${round}, ${debitExtId}::uuid)`;
+        return { status: "rejected" as const };
+      }
+      await tx`SELECT repo.confirm_debit_v1(${round}, ${debitExtId}::uuid, ${active})`;
+      return { status: "confirmed" as const, balance };
+    }).catch(intoRepoError);
   }
 
   /** Record a credit on a round and, unless `active`, close it. A round holds 0..N credits — each
@@ -202,35 +233,44 @@ export class Repository {
     return [bet, credit];
   }
 
-  /** Reverse one or more of a round's debits, per-debit, in one atomic batch. Each item names a
-   *  debit by `ref` (its RGS ext_id) and carries the RGS rollback id (`extId`); the wallet mints a
-   *  rollback transaction id per reversal. Returns `{ id, amount }` per item, IN INPUT ORDER:
-   *  `amount` is the refunded stake, or 0 for a tombstone (an orphan rollback that arrived before
-   *  its debit — the straggler is then fenced). IDEMPOTENT on each debit ref (a replay returns the
-   *  existing rollback). Throws ErrConcurrent if a referenced debit is still `pending` (retry the
-   *  batch), ErrNotClosable if the round is already closed, and ErrSessionMismatch (SESMM) if the
-   *  session doesn't match the bet's recorded session. The round is closed unless `active`.
+  /** Reverse named debits or credits of an open round, per-ref, in one atomic batch. Each item
+   *  names a transaction by `ref` (its RGS ext_id) and carries the RGS rollback id (`extId`); the
+   *  wallet mints a rollback transaction id per reversal. Returns `{ id, amount, type }` per item,
+   *  IN INPUT ORDER: `type` is what was reversed (a debit's stake to refund, a credit's win to claw
+   *  back), or null with amount 0 for a tombstone (an orphan rollback that arrived before the
+   *  transaction it names — the straggler is then fenced). Reversing a single-shot's debit also
+   *  reverses the win it carried, returned as an extra row with `cascaded` set: its money moves,
+   *  but it isn't one of the request's rollback ids. IDEMPOTENT on each ref (a replay returns the
+   *  existing rollback). Throws ErrConcurrent if a referenced transaction is still `pending`
+   *  (settle it first — see settleDebit), ErrNotClosable if the round is closed, and
+   *  ErrSessionMismatch (SESMM) if the session doesn't match the bet's recorded session. The round
+   *  is closed unless `active`.
    *  An orphan rollback creates the bet from the session so the tombstone has a home. */
-  async rollbackDebits(params: {
+  async rollback(params: {
     round: number;
     session: Session;
     items: { ref: string; extId: string }[];
     active: boolean;
-  }): Promise<{ id: string; amount: number }[]> {
+  }): Promise<{ id: string; amount: number; type: "debit" | "credit" | null; cascaded: boolean }[]> {
     // The wallet mints a rollback transaction id per reversal; the whole batch is reversed in one
     // atomic proc call (a RAISE inside aborts it), then the round closes unless the RGS keeps it
     // open. The batch is passed as the raw JS array cast `::jsonb` — Bun encodes that to a real jsonb
     // array (whereas `${arr}::uuid[]` comma-joins to a malformed literal, and pre-`JSON.stringify`
     // double-encodes to a scalar — see the proc comment).
     const { round, session, items, active } = params;
-    const batch = items.map((i) => ({ ref: i.ref, id: Bun.randomUUIDv7(), ext: i.extId }));
+    const batch = items.map((i) => ({ ref: i.ref, id: Bun.randomUUIDv7(), ext: i.extId, cid: Bun.randomUUIDv7() }));
     const rows = await this.sql`
-      SELECT rollback_id, rollback_amount FROM repo.rollback_debits_v1(
+      SELECT rollback_id, rollback_amount, reversed_type, cascaded FROM repo.rollback_v1(
         ${round}, ${session.id}::uuid, ${session.user}, ${session.game}, ${session.currency},
         ${batch}::jsonb, ${active}
       )
     `.catch(intoRepoError);
-    return rows.map((r: Record<string, unknown>) => ({ id: r.rollback_id as string, amount: Number(r.rollback_amount) }));
+    return rows.map((r: Record<string, unknown>) => ({
+      id: r.rollback_id as string,
+      amount: Number(r.rollback_amount),
+      type: r.reversed_type as "debit" | "credit" | null,
+      cascaded: r.cascaded as boolean,
+    }));
   }
 
   /** Read a bet. Throws ErrNotFound for an unknown round OR a round with no debit (an orphan rollback
