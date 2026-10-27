@@ -238,9 +238,10 @@ export class Repository {
    *  wallet mints a rollback transaction id per reversal. Returns `{ id, amount, type }` per item,
    *  IN INPUT ORDER: `type` is what was reversed (a debit's stake to refund, a credit's win to claw
    *  back), or null with amount 0 for a tombstone (an orphan rollback that arrived before the
-   *  transaction it names — the straggler is then fenced). Reversing a single-shot's debit also
-   *  reverses the win it carried, returned as an extra row with `cascaded` set: its money moves,
-   *  but it isn't one of the request's rollback ids. IDEMPOTENT on each ref (a replay returns the
+   *  transaction it names — the straggler is then fenced). Reversing a single-shot's debit (only
+   *  possible while it was pending — a single-shot closes its round) also reverses the win it
+   *  carried, returned as an extra row with `cascaded` set: its money moves, but it isn't one of
+   *  the request's rollback ids. IDEMPOTENT on each ref (a replay returns the
    *  existing rollback). Throws ErrConcurrent if a referenced transaction is still `pending`
    *  (settle it first — see settleDebit), ErrNotClosable if the round is closed, and
    *  ErrSessionMismatch (SESMM) if the session doesn't match the bet's recorded session. The round

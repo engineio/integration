@@ -234,27 +234,6 @@ describe("rollback", () => {
     expect(rb.body.balance.amount).toBe(90_000_000); // d2 refunded, c1 clawed back; d1's stake stands
   });
 
-  walletTest("reversing an open single-shot's debit claws back the win it carried", async ({ call, session }) => {
-    const s = await session(100_000_000);
-    const round = 57;
-    const debitId = uuid();
-    const shot = await call("/v1/debit", signed({
-      token: s.token, round, active: true, mode: "base", ip: "1.1.1.1",
-      debit: { id: debitId, amount: 10_000_000, currency: "USD" },
-      credit: { id: uuid(), amount: 30_000_000, ref: debitId, currency: "USD" },
-    }));
-    expect(shot.body.balance.amount).toBe(120_000_000);
-
-    const rbReq = signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref: debitId }] });
-    const rb = await call("/v1/rollback", rbReq);
-    expect(rb.status).toBe(200);
-    expect(rb.body.rollback_ids).toHaveLength(1);
-    expect(rb.body.balance.amount).toBe(100_000_000);
-    const replay = await call("/v1/rollback", rbReq);
-    expect(replay.body.rollback_ids).toEqual(rb.body.rollback_ids);
-    expect(replay.body.balance.amount).toBe(100_000_000);
-  });
-
   walletTest("a clawback the player can't cover takes the balance negative, and blocks stakes", async ({ call, session }) => {
     const s = await session(10_000_000);
     const round = 52;

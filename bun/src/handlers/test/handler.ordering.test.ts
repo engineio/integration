@@ -367,10 +367,14 @@ describe("out-of-order & idempotency", () => {
     await sql`INSERT INTO repo.transaction (id, bet_id, type, status, concurrent, amount, ext_id, reference)
               VALUES (${uuid()}::uuid, ${round}, 'credit', 'pending'::repo.transaction_status, true, 30000000, ${uuid()}::uuid, ${ref}::uuid)`;
 
-    const rb = await call("/v1/rollback", signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref }] }));
+    const rbReq = signed({ token: s.token, round, active: false, rollbacks: [{ id: uuid(), ref }] });
+    const rb = await call("/v1/rollback", rbReq);
     expect(rb.status).toBe(200);
     expect(rb.body.rollback_ids).toHaveLength(1);
     expect(rb.body.balance.amount).toBe(100_000_000); // stake and win both moved, both reversed
+    const replay = await call("/v1/rollback", rbReq);
+    expect(replay.body.rollback_ids).toEqual(rb.body.rollback_ids);
+    expect(replay.body.balance.amount).toBe(100_000_000);
   });
 
   walletTest("a straggler debit racing the rollback that fences it can't keep a stake", async ({ call, session, sql }) => {

@@ -695,9 +695,8 @@ operation - for rounds that resolve the moment they're placed. Today's RGS doesn
 pays a win with a separate `/credit`), but the contract allows it and the conformance suite
 sends it, so support it.
 
-A single-shot normally carries `active:false` - the debit opens the round and closes it at
-once, with no later credit to close it. Don't reject one with `active:true`, though: apply it
-and leave the round open.
+A single-shot always carries `active:false` - the debit opens the round and closes it at
+once, with no later credit to close it.
 
 ```
 RGS                                          Wallet
@@ -724,8 +723,9 @@ The response carries **both** `debit_id` and `credit_id`. Both must be idempoten
 (each keyed by its own wallet transaction id). "Together" means the **two balance
 movements** - the stake and the win - apply atomically as one unit (one idempotent balance
 call): if either fails, neither applies. With a separate balance service that single call is the
-money-moving step of the debit flow (§7.2), between recording the bet and confirming it. The same
-unit holds in reverse: a rollback of the debit reverses the win it carried too (§6.5).
+money-moving step of the debit flow (§7.2), between recording the bet and confirming it. Because
+it closes the round, a later rollback of a single-shot is refused with `ERR_BC` (§6.5) - unless
+it is still mid-flight in a separated wallet (§7.2d).
 
 ### 6.5 Rollback: reverse debits or credits on an open round
 
@@ -744,11 +744,9 @@ the request carries a **list**, each entry naming one transaction by `ref`:
 }
 ```
 
-Reversing a **debit** refunds its stake (escrow → available) - and if it was a single-shot
-(§6.4), claws back the win it carried as well, since the two were one call; that extra reversal
-isn't one of the `rollback_ids`. Reversing a **credit** claws its win back (available → payout
-account), and that clawback must land even if the player has spent the win: it can take
-`available` below zero. What to do about a negative balance -
+Reversing a **debit** refunds its stake (escrow → available). Reversing a **credit** claws its
+win back (available → payout account), and that clawback must land even if the player has spent
+the win: it can take `available` below zero. What to do about a negative balance -
 block play until it's topped up, recover it from the next deposit, write it off - is the
 operator's business decision; the contract only requires that you never refuse the clawback
 (no `ERR_IPB` on a rollback). Each reversal records a rollback transaction (keyed by its `id`,
@@ -1024,8 +1022,10 @@ rollback must resolve it: the RGS sends a rollback only once it has stopped send
 so nothing else ever will. Under the debit's row lock (its own request may still be running),
 re-drive its idempotent `balance.apply` on the same key - that either reports the stake that
 already moved or takes it now - confirm it without applying its own `active:false` (the round
-must stay open for the reversal), then reverse it. If the stake can't be afforded,
-nothing moved: delete the `pending` debit and tombstone it, as for an unseen one. Only an
+must stay open for the reversal), then reverse it. If it was a single-shot, its win moved in
+that same `balance.apply`, so reversing it claws the win back too: the call never answered, so
+neither leg stands (that extra reversal isn't one of the `rollback_ids`). If the stake can't be
+afforded, nothing moved: delete the `pending` debit and tombstone it, as for an unseen one. Only an
 *uncertain* `balance.apply` here is `ERR_UE`; answering a `pending` debit with a bare retryable
 error just makes the RGS re-send the rollback forever. A credit for a round with no debit is a
 different case: the RGS credits a round only after its debit returned `2xx`, so a credit can't
