@@ -54,7 +54,7 @@ type RollbackRequest = FromSchema<typeof schema.request>;
  * A debit still `pending` (its request died mid-flight, and the RGS never re-sends it) is settled
  * first as its own request would have — funded and confirmed, or deleted if the stake can't be
  * afforded — except that the round is kept open so the reversal can land. Then the bet ledger decides each reversal:
- *   - a confirmed debit is reversed and its stake refunded (a single-shot's win with it); a credit
+ *   - a confirmed debit is reversed and its stake refunded (a pending single-shot's win with it); a credit
  *     is reversed and its win clawed back, even into a negative balance — what to do about that is
  *     the operator's call;
  *   - an already-reversed ref replays the existing rollback (idempotent on the ref);

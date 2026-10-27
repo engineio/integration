@@ -282,9 +282,10 @@ $$;
 -- which Bun double-encodes into a scalar; a plain JS array cast `::jsonb` binds correctly). Each
 -- item { ref, id, ext } reverses the debit or credit named by `ref`, returning the canonical
 -- rollback id, the amount, and the reversed type (debit → refund the stake, credit → claw back the
--- win; NULL for a tombstone) IN INPUT ORDER. Reversing a single-shot's debit also reverses the win
--- it carried — the two were one call — returned as an extra `cascaded` row (moved, but not one of
--- the request's rollback_ids). Per item:
+-- win; NULL for a tombstone) IN INPUT ORDER. A single-shot closes its round, so its debit is only
+-- reversible while it was still pending (the handler settles it with the round kept open): that
+-- reversal also reverses the win it carried — the two were one call that never answered —
+-- returned as an extra `cascaded` row (moved, but not one of the request's rollback_ids). Per item:
 --   * the session doesn't match the bet's recorded session → RAISE SESMM before anything moves
 --     (alignment, not token liveness, authorizes a rollback — see the file header)
 --   * already reversed (replay, or a prior tombstone)  → return the existing rollback (idempotent
@@ -402,8 +403,8 @@ BEGIN
         rollback_id := v_rb_id; rollback_amount := v_amount; reversed_type := v_type; cascaded := false;
         RETURN NEXT;
 
-        -- Reversing a single-shot's debit reverses the win it carried too, unless that win was
-        -- already reversed by name.
+        -- Reversing a (once pending) single-shot's debit reverses the win it carried too, unless that
+        -- win was already reversed by name.
         IF v_type = 'debit' THEN
             SELECT c.ext_id, c.amount INTO v_cc_ext, v_cc_amt
             FROM repo.transaction c
